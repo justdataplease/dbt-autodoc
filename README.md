@@ -202,3 +202,11 @@ The tool tracks which user is running the script to populate the `user_name` fie
     AI descriptions include the `(ai_generated)` tag. You can leave them as is, or edit them. If you remove the tag, the script will treat them as human-written and protect them from future updates.
 3.  **Regenerate Poor AI Descriptions:**
     If an AI description is poor, simply delete it (from the YAML or SQL file) and run with `--generate-docs-yml-ai` (for columns) or `--generate-docs-config-ai` (for tables) to generate a new one.
+
+## 🤝 Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+## 📄 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
