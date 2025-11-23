@@ -582,7 +582,7 @@ def action_cleanup():
 
 async def action_cleanup_db(db):
     print("\n⚠️  WARNING: This will delete 'doc_cache' and 'doc_cache_log' tables from the database.")
-    print("   This action cannot be undone.")
+    print("   This action cannot be undone. Make sure to backup your existing data not to lose it.")
     try:
         confirm = input("🔴 DROP TABLES? (type 'yes'): ")
         if confirm.lower().strip() != 'yes': return
