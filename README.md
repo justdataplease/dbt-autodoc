@@ -15,8 +15,6 @@
 1.  **Install:**
     ```bash
     pip install dbt-autodoc
-    # OR if you use Postgres:
-    pip install dbt-autodoc[postgres]
     ```
 
 2.  **Configuration:**

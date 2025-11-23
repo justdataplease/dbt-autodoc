@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dbt-autodoc"
-version = "1.0.4"
+version = "1.0.5"
 description = "Automated documentation generator for dbt projects using Google Gemini AI"
 readme = "README.md"
 authors = [
@@ -23,10 +23,10 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "dbt-osmosis",
     "dbt-duckdb",
+    "asyncpg",
 ]
 
 [project.optional-dependencies]
-postgres = ["asyncpg"]
 dev = ["pytest", "pytest-mock", "pytest-asyncio", "build", "twine"]
 
 [project.scripts]
