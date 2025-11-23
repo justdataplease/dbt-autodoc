@@ -7,6 +7,7 @@ import argparse
 import re
 import sys
 import asyncio
+from functools import wraps
 from dotenv import load_dotenv, dotenv_values, find_dotenv
 
 # --- 1. ROBUST DEPENDENCY CHECK ---
@@ -885,8 +886,19 @@ def main():
     # Workaround for Windows asyncio issue
     if sys.platform == 'win32':
         try:
-            from asyncio import WindowsSelectorEventLoopPolicy
-            asyncio.set_event_loop_policy(WindowsSelectorEventLoopPolicy())
+            from asyncio.proactor_events import _ProactorBasePipeTransport
+            
+            def silence_event_loop_closed(func):
+                @wraps(func)
+                def wrapper(*args, **kwargs):
+                    try:
+                        return func(*args, **kwargs)
+                    except RuntimeError as e:
+                        if str(e) != 'Event loop is closed':
+                            raise
+                return wrapper
+
+            _ProactorBasePipeTransport.__del__ = silence_event_loop_closed(_ProactorBasePipeTransport.__del__)
         except ImportError:
             pass
 
