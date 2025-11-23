@@ -1,0 +1,17 @@
+# dbt-autodoc configuration
+
+# --- DATABASE SETTINGS ---
+# Options: "duckdb" or "postgres", use POSTGRES_URL="postgresql://user:pass@host:port/db" env var for Postgres.
+db_type: "duckdb"
+duckdb_path: "docs_backup.duckdb"
+
+# --- FILE SETTINGS ---
+dbt_models_dir: "models"
+ai_tag: "(ai_generated)"
+
+# --- AI SETTINGS ---
+gemini_model: "gemini-2.5-flash"
+concurrency: 1  # Max concurrent AI/DB requests
+
+# --- CONTEXT ---
+company_context: "Describe your company here (e.g. A global travel service...)"
