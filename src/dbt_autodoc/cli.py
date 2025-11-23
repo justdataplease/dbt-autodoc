@@ -811,7 +811,7 @@ async def async_main():
     parser.add_argument("--show-prompt", action="store_true", help="Print the prompt sent to AI for debugging")
     parser.add_argument("--gemini-api-key", type=str, help="Google Gemini API Key (overrides env var)")
     
-    parser.add_argument("--concurrency", type=int, default=1, help="Max concurrent AI/DB requests (default: 1). Note: concurrency is for postgres only")
+    parser.add_argument("--concurrency", type=int, default=None, help="Max concurrent AI/DB requests (default: 1). Note: concurrency is for postgres only")
 
     try:
         args = parser.parse_args()
@@ -882,7 +882,21 @@ async def async_main():
         print("\n✨ Operation Complete.")
 
 def main():
-    asyncio.run(async_main())
+    # Workaround for Windows asyncio issue
+    if sys.platform == 'win32':
+        try:
+            from asyncio import WindowsSelectorEventLoopPolicy
+            asyncio.set_event_loop_policy(WindowsSelectorEventLoopPolicy())
+        except ImportError:
+            pass
+
+    try:
+        asyncio.run(async_main())
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        print(f"❌ Fatal Error: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
