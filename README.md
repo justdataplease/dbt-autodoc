@@ -234,3 +234,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ## 📄 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## 🙏 Attribution
+
+Brought to you by [JustDataPlease](https://justdataplease.com/agency/).

@@ -837,7 +837,16 @@ async def async_main():
         sys.exit(1)
 
     # Initialize semaphore
-    concurrency = args.concurrency or CFG.get('concurrency') or 10
+    concurrency_val = args.concurrency
+    if concurrency_val is None:
+        concurrency_val = CFG.get('concurrency', 10)
+    
+    try:
+        concurrency = int(concurrency_val)
+    except (ValueError, TypeError):
+        print(f"⚠️  Invalid concurrency value: {concurrency_val}. Using default 10.")
+        concurrency = 10
+
     concurrency_sem = asyncio.Semaphore(concurrency)
 
     # --- VALIDATION ---
@@ -909,6 +918,11 @@ def main():
     except Exception as e:
         print(f"❌ Fatal Error: {e}")
         sys.exit(1)
+    
+    # Aggressive exit to prevent Windows asyncio shutdown errors
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 if __name__ == "__main__":
     main()
