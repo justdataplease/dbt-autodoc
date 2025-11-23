@@ -1,14 +1,14 @@
 # DBT Autodoc Documentation
 
-`dbt-autodoc` is an automated tool to generate and manage documentation for your dbt models using Google Gemini AI. It integrates with `dbt-osmosis` to synchronize your YAML files and ensures that your documentation is consistent, version-controlled, and easily maintainable.
+`dbt-autodoc` is the ultimate tool for **Automated Documentation** and **Logging** for your dbt projects. It combines the power of Google Gemini AI with a robust **Database Logging** system to ensure your documentation is always up-to-date, accurate, and auditable.
 
-## 🚀 Features
+## 🌟 Why dbt-autodoc?
 
--   **Automated Generation:** Uses Google Gemini AI to generate technical descriptions for tables and columns.
--   **YAML Synchronization:** Keeps your `schema.yml` files in sync with your dbt models using `dbt-osmosis`.
--   **Caching & History:** Stores descriptions in a database (`duckdb` or `postgres`) to prevent regenerating existing documentation and tracks changes over time.
--   **User Tracking:** Logs who made changes to the documentation (based on environment variables or system user).
--   **Smart Updates:** Respects human-written documentation and allows forcing re-generation via tags.
+-   **🤖 Automatic AI Documentation:** Generate comprehensive descriptions for your tables and columns automatically.
+-   **💾 Database Logging & History:** Every description is stored in a database (`duckdb` or `postgres`). This acts as a "Source of Truth" and provides a full history of changes.
+-   **🔄 Full Synchronization:** Seamlessly integrates with `dbt-osmosis` to keep your YAML files in sync with your SQL models.
+-   **🔒 Protect Manual Work:** Respects human-written documentation. If you write it, we lock it.
+-   **👥 Team Ready:** Use Postgres to share documentation cache across your entire team.
 
 ## 🛠️ Setup
 
@@ -18,222 +18,94 @@
     ```
 
 2.  **Configuration:**
-    When you run `dbt-autodoc` for the first time, it will automatically generate a `dbt-autodoc.yml` configuration file in your project root.
-    
-    **Important:** You should edit this file to provide context about your company (`company_context`), which significantly improves the AI's ability to generate accurate descriptions.
-    
-    **Supported AI:** Currently, this tool supports **Google Gemini** models (e.g., `gemini-2.5-flash`).
+    Run `dbt-autodoc` to generate `dbt-autodoc.yml`.
+    **Important:** Edit `company_context` in this file to give the AI knowledge about your business logic.
 
-3.  **Environment Variables (Optional):**
-    You can provide keys via environment variables (e.g. in a `.env` file) OR pass them as command-line arguments.
+3.  **Environment Variables:**
     ```env
     GEMINI_API_KEY=your_api_key_here
-    POSTGRES_URL=postgresql://user:pass@host:port/db (if using postgres)
-    DBT_USER=your_username (optional, for tracking)
+    POSTGRES_URL=postgresql://user:pass@host:port/db (optional)
     ```
-    *Note: The tool attempts to load `.env` automatically. If that fails, it has a fallback to manually parse `POSTGRES_URL` from the `.env` file directly.*
 
 ## 📋 Recommended Workflow
 
-For the best results, follow this workflow to build your documentation incrementally:
+For the best results, follow this step-by-step workflow to ensure accuracy and control:
 
-1.  **Initial Setup:**
-    Run the tool once to generate `dbt-autodoc.yml`. Edit the file and fill in `company_context` with a detailed description of your business.
-
-2.  **Step 1: Generate Table Descriptions (SQL)**
-    Run the tool to generate descriptions for your models (tables/views) inside your SQL files.
+1.  **Preparation:**
+    Update your dbt project and context.
     ```bash
-    dbt-autodoc --generate-docs-config-ai
-    ```
-    *Why?* The AI uses the company context to describe what the table represents.
-
-3.  **Step 2: Review & Refine Tables**
-    Open your `.sql` files. Review the generated `{{ config(description=...) }}`.
-    -   If it's good, leave it (or remove the `(ai_generated)` tag to lock it).
-    -   If it's bad, edit it manually.
-    -   **Run the tool again** to save your manual edits to the database "Source of Truth".
-
-4.  **Step 3: Generate Column Descriptions (YAML)**
-    Once table descriptions are solid, generate the column descriptions.
-    ```bash
-    dbt-autodoc --generate-docs-yml-ai
-    ```
-    *Why?* The AI now uses *both* the company context AND the specific table description to generate highly accurate column definitions.
-
-5.  **Step 4: Review & Refine Columns**
-    Check the generated `schema.yml` (or `_*.yml`) files.
-    -   Refine definitions where necessary.
-    -   Rerun `dbt-autodoc --generate-docs-yml` to sync your manual changes to the database.
-
-6.  **Fast Track (Optional):**
-    Once you are comfortable with the tool, you can run both generations at once. The tool will automatically prioritize tables first, then columns.
-    ```bash
-    dbt-autodoc --generate-docs-config-ai --generate-docs-yml-ai
+    dbt run
+    # Edit dbt-autodoc.yml with company_context
     ```
 
-## 🗄️ Database Selection: DuckDB vs Postgres
+2.  **Sync Structure (No AI):**
+    Regenerate YAML files to match the SQL models. This ensures all new columns are present.
+    ```bash
+    dbt-autodoc --regenerate-yml
+    ```
 
--   **DuckDB (`db_type: duckdb`)**:
-    -   **Best for:** Individual developers, local testing, or single-user projects.
-    -   **Pros:** Zero setup, fast, simple file-based database (`docs_backup.duckdb`).
-    -   **Cons:** Cannot be easily shared concurrently between team members.
+3.  **Generate Table Descriptions (SQL):**
+    Generate AI descriptions for your models (tables/views).
+    ```bash
+    dbt-autodoc --generate-docs-config-ai --model-path models/staging
+    ```
 
--   **Postgres (`db_type: postgres`)**:
-    -   **Best for:** Production environments and Teams.
-    -   **Pros:** Centralized "Source of Truth". Multiple developers can run the tool and share the same cache/history. If one developer documents a model, others get it automatically without regenerating.
-    -   **Cons:** Requires a running Postgres instance.
+4.  **Manual Review (Important):**
+    Open your YAML files. Review the structure and any existing descriptions. If you manually update a description here, it will be protected from AI overwrites in the next step.
 
-## 📖 Usage & Arguments
+5.  **Generate Column Descriptions (YAML):**
+    Use AI to fill in the missing column descriptions.
+    ```bash
+    dbt-autodoc --generate-docs-yml-ai --model-path models/staging
+    ```
 
-Run the tool from the command line:
+6.  **Propagate & Save:**
+    Run osmosis again to apply inheritance rules to all the dbt project, then run the tool again to save the final state (including inherited descriptions) to the database.
+    ```bash
+    dbt-autodoc --regenerate-yml
+    dbt-autodoc --generate-docs-yml-ai --model-path models/staging
+    ```
 
-```bash
-dbt-autodoc [ARGUMENTS]
-```
+7.  **Next Layer:**
+    Repeat steps 2-6 for `models/intermediate`, `models/marts`, etc.
 
-> **Recommended:** Run `dbt run` (or `dbt compile`) before running this tool to ensure your project manifest is up to date.
+## 🚀 Quick Start (Automated)
 
-### Database Maintenance
-
-If you need to reset the database schema (e.g., during development or if the schema becomes corrupted), you can use the `--cleanup-db` flag.
-
-**Warning:** This operation is destructive and will delete all cached descriptions and history.
-
-```bash
-dbt-autodoc --cleanup-db
-```
-
-### Database Maintenance
-
-If you need to reset the database schema (e.g., during development or if the schema becomes corrupted), you can use the `--cleanup-db` flag.
-
-**Warning:** This operation is destructive and will delete all cached descriptions and history.
+If you trust the process and just want to run everything at once:
 
 ```bash
-dbt-autodoc --cleanup-db
+dbt-autodoc --generate-docs-ai
 ```
 
-### Available Arguments
+## 🧠 How the AI Works
+
+When generating a description for a column or table, the AI considers multiple inputs to produce the most accurate result:
+
+1.  **Company Context:** The high-level business logic defined in your config.
+2.  **Model SQL:** The actual code of the model being documented.
+3.  **Existing Descriptions:** Any existing documentation or comments in the file.
+4.  **Upstream Logic:** (Implicitly via Osmosis inheritance) Context from upstream models.
+
+It synthesizes all these inputs to write a concise, technical description.
+
+## 📖 Arguments Reference
 
 | Argument | Description |
 | :--- | :--- |
-| `--generate-docs-yml` | **Sync Structure Only.** Runs `dbt-osmosis` to update YAML files with new columns/models. **Saves manual edits** to the database. Use this to sync files without AI. |
-| `--generate-docs-yml-ai` | **Sync & Generate Columns.** Runs `dbt-osmosis`, then scans `_*.yml` files. If a column description is missing, calls AI to generate it. |
-| `--generate-docs-config` | **Sync SQL Configs.** Updates SQL files. Read-only mode for descriptions (doesn't generate new ones). **Saves manual edits** to the database. |
-| `--generate-docs-config-ai` | **Generate Table Descriptions.** Scans `.sql` model files. If a table description is missing in the `{{ config() }}` block, calls AI to generate it. |
-| `--show-prompt` | **Debug Mode.** Prints the exact prompt sent to the AI without saving the result. Useful for testing prompt engineering. |
-| `--cleanup-yml` | **Cleanup YAML.** Deletes temporary `_*.yml` files generated by osmosis if needed. |
-| `--cleanup-db` | **Cleanup Database.** Drops the `doc_cache` and `doc_cache_log` tables from the database. Useful for resetting the schema or cache. **Irreversible.** |
-| `--gemini-api-key` | Overrides the API key from environment variables. |
-| `--concurrency` | Sets the maximum number of concurrent AI/DB requests (default: 10). Can also be set in `dbt-autodoc.yml`. Note: concurrency is for postgres only. |
-
-## 🧠 How It Works
-
-The tool follows a strict logic flow to determine whether to keep, update, or generate a description.
-
-### 1. Description Resolution Logic
-
-For every Column (in YAML) or Table (in SQL), the script follows a strict hierarchy to decide what to do. The goal is to **protect your manual work** while automating the rest.
-
-1.  **Human Written (Highest Priority):**
-    -   **Definition:** Any description that **does not** contain the `(ai_generated)` tag.
-    -   **Behavior:** The script assumes you wrote this manually and that it is the "Source of Truth".
-    -   **Action:** It **will NOT use AI** to generate another response. It **will NOT overwrite** your text. It effectively "locks" the description. It also saves this description to the database so that if you accidentally delete it later, it can be restored.
-
-2.  **Existing AI:**
-    -   **Definition:** A description containing the `(ai_generated)` tag.
-    -   **Behavior:** The script considers this valid but "owned" by the machine.
-    -   **Action:** It preserves the existing AI generation.
-    -   **How to Regenerate:** If you want to regenerate an AI description, simply **delete it** from the file and run the script again with an AI flag (`--generate-docs-yml-ai` or `--generate-docs-config-ai`).
-
-3.  **Cache Restore:**
-    -   **Behavior:**
-        -   If running **WITHOUT AI** (`--generate-docs-yml` or `--generate-docs-config`): The script attempts to restore missing descriptions from the `doc_cache` database. This protects against accidental deletion.
-        -   If running **WITH AI** (`--generate-docs-yml-ai` or `--generate-docs-config-ai`): The script assumes a missing description means you want to generate a new one, so it **skips** the cache restore (unless the cached version was human-written).
-
-4.  **Generate AI (Lowest Priority):**
-    -   **Definition:** No description in file, and not restored from cache.
-    -   **Action:** Calls Google Gemini to generate a new description.
-
-#### 🔎 Examples
-
-**Example 1: Protecting Manual Work (Human Override)**
--   **Scenario:** The AI previously generated: `"Flag indicating if user is active (ai_generated)"`.
--   **Your Action:** You decide this is too vague. You manually edit the YAML file to: `"Flag for users who have logged in within the last 30 days."` (Note: You removed the tag).
--   **Result:** On the next run, the tool sees no tag. It marks it as **Human Written**. It updates the database with your new definition but **will not** call the AI or overwrite your text. Your manual definition is now safe.
-
-**Example 2: Forcing an AI Update (Regenerate)**
--   **Scenario:** The file has a description: `"Total value of orders (ai_generated)"` which you think is wrong.
--   **Your Action:** You delete the description line (or make it empty).
--   **Result:** Run `dbt-autodoc --generate-docs-yml-ai`. The tool sees the description is missing. It ignores the old cached AI value and calls Gemini to generate a fresh one.
--   **Final Output:** `"Sum of gross merchandise value for completed orders (ai_generated)"`.
-
-**Example 3: Restoring Lost Documentation**
--   **Scenario:** You run a command that accidentally wipes descriptions, and you want them back without using AI.
--   **Action:** Run `dbt-autodoc --generate-docs-yml` (no AI).
--   **Result:** The tool checks `doc_cache` and restores your last known descriptions.
-
-### 2. Special Tags
-
--   **(ai_generated)**: Automatically appended to all AI-generated descriptions. Identifies content that can be updated by the script.
-
-### 3. Database & Caching
-
-The tool maintains two tables in your database (`duckdb` local file or `postgres`):
-
-#### `doc_cache`
-Stores the *current* active description for every model and column.
--   **Purpose:** Prevents regenerating documentation for unchanged models (saves money/time) and serves as a backup.
--   **Columns:**
-    -   `dbt_project_name`
-    -   `dbt_profile_name`
-    -   `model_name`
-    -   `column_name`
-    -   `description`
-    -   `user_name`
-    -   `is_human`: Boolean flag indicating if the description was manually written (True) or AI-generated (False).
-    -   `updated_at`
-
-#### `doc_cache_log`
-An audit log of all changes made to descriptions.
--   **Purpose:** Tracks who changed what and when. Useful for debugging or rolling back.
--   **Trigger:** Written to whenever a description changes (e.g., `Old Value` -> `New Value`).
--   **Columns:**
-    -   `dbt_project_name`
-    -   `dbt_profile_name`
-    -   `model_name`
-    -   `column_name`
-    -   `old_description`
-    -   `new_description`
-    -   `user_name`
-    -   `is_human`: Boolean flag representing the status of the *new* description.
-    -   `changed_at`
-
-### 4. User Tracking
-
-The tool tracks which user is running the script to populate the `user_name` field in the logs. It resolves the user in this order:
-1.  `DBT_USER` environment variable.
-2.  `USER` environment variable.
-3.  `USERNAME` environment variable.
-4.  System logged-in user (`getpass.getuser()`).
-5.  Fallback to `'unknown'`.
-
-## 📝 Best Practices
-
-1.  **Run Structure Sync First:**
-    Run `dbt-autodoc --generate-docs-yml` frequently to keep your YAML files consistent with your SQL models without calling AI.
-2.  **Review AI Changes:**
-    AI descriptions include the `(ai_generated)` tag. You can leave them as is, or edit them. If you remove the tag, the script will treat them as human-written and protect them from future updates.
-3.  **Regenerate Poor AI Descriptions:**
-    If an AI description is poor, simply delete it (from the YAML or SQL file) and run with `--generate-docs-yml-ai` (for columns) or `--generate-docs-config-ai` (for tables) to generate a new one.
-
-## 🤝 Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
+| `--regenerate-yml` | **Structure Only.** Only runs `dbt-osmosis` to regenerate YAML files from dbt models. Does not sync to DB or call AI. |
+| `--model-path` | Restrict processing to a specific directory (e.g. `models/staging`). |
+| `--generate-docs-config-ai` | Generate table descriptions in `.sql` files using AI. |
+| `--generate-docs-yml-ai` | Generate column descriptions in `.yml` files using AI. |
+| `--generate-docs-config` | Sync `.sql` files from cache (no AI). |
+| `--generate-docs-yml` | Sync `.yml` files from cache (no AI). |
+| `--generate-docs-ai` | **🔥 Full Auto.** Runs the complete workflow: SQL generation, Osmosis sync, and YAML generation using AI. |
+| `--generate-docs` | **🔄 Full Sync.** Runs the complete workflow using only the database cache (no AI). |
+| `--cleanup-db` | **Reset Database.** Wipes the description cache and history. |
+| `--concurrency` | Max threads for AI/DB requests (default: 10). |
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT License - see [LICENSE](LICENSE) for details.
 
 ## 🙏 Attribution
 

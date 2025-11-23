@@ -2,22 +2,21 @@ import pytest
 from unittest.mock import MagicMock, patch, AsyncMock, call
 from dbt_autodoc import cli
 
-@pytest.mark.asyncio
 class TestDatabaseAdapter:
     @patch("duckdb.connect")
-    async def test_init_table_duckdb(self, mock_connect):
+    def test_init_table_duckdb(self, mock_connect):
         mock_conn = MagicMock()
         mock_connect.return_value = mock_conn
         
         db = cli.DatabaseAdapter(project_info={"name": "test", "profile": "test"})
         db.type = 'duckdb' # Ensure type is duckdb
-        await db.connect()
+        db.connect()
         
         # We mock migrate_schema to avoid complex interactions or let it run?
         # Let's mock it to focus on init_table logic
-        with patch.object(db, 'migrate_schema', new_callable=AsyncMock) as mock_migrate:
+        with patch.object(db, 'migrate_schema', new_callable=MagicMock) as mock_migrate:
             mock_migrate.return_value = False # No reset needed
-            await db.init_table()
+            db.init_table()
             
             # Check if create table statements were executed
             assert mock_conn.execute.call_count >= 2
@@ -34,25 +33,29 @@ class TestDatabaseAdapter:
             mock_migrate.assert_called_once()
 
     @patch("duckdb.connect")
-    async def test_save_duckdb(self, mock_connect):
+    def test_save_duckdb(self, mock_connect):
         mock_conn = MagicMock()
         mock_connect.return_value = mock_conn
         
         db = cli.DatabaseAdapter(project_info={"name": "p1", "profile": "prof1"})
         db.type = 'duckdb'
-        await db.connect()
+        db.connect()
         
         # Mock get to return None (new entry)
-        with patch.object(db, 'get', new_callable=AsyncMock) as mock_get:
+        with patch.object(db, 'get', new_callable=MagicMock) as mock_get:
             mock_get.return_value = None
             
             # Mock log_change to do nothing
-            with patch.object(db, 'log_change', new_callable=AsyncMock) as mock_log:
-                await db.save("my_model", "my_col", "desc")
+            with patch.object(db, 'log_change', new_callable=MagicMock) as mock_log:
+                db.save("my_model", "my_col", "desc")
                 
-                # Check execute called with insert
-                assert mock_conn.execute.called
-                args, _ = mock_conn.execute.call_args
+                # Check execute called via cursor (since new code uses cursor())
+                # We mocked mock_connect.return_value = mock_conn
+                # Code calls self.conn.cursor().execute(...)
+                # So we should check if mock_conn.cursor.return_value.execute was called
+                
+                assert mock_conn.cursor.return_value.execute.called
+                args, _ = mock_conn.cursor.return_value.execute.call_args
                 assert "INSERT OR REPLACE INTO doc_cache" in args[0]
                 # Check params
                 params = args[1]
@@ -64,36 +67,37 @@ class TestDatabaseAdapter:
                 assert params[4] == "desc"
 
     @patch("duckdb.connect")
-    async def test_get_duckdb(self, mock_connect):
+    def test_get_duckdb(self, mock_connect):
         mock_conn = MagicMock()
         mock_connect.return_value = mock_conn
         # Mock fetchone result
-        mock_conn.execute.return_value.fetchone.return_value = ["existing_desc"]
+        # Code: self.conn.cursor().execute(q, params).fetchone()
+        mock_conn.cursor.return_value.execute.return_value.fetchone.return_value = ["existing_desc"]
         
         db = cli.DatabaseAdapter(project_info={"name": "p1", "profile": "prof1"})
         db.type = 'duckdb'
-        await db.connect()
+        db.connect()
         
-        val = await db.get("my_model", "my_col")
+        val = db.get("my_model", "my_col")
         assert val == "existing_desc"
         
         # Verify query
-        args, _ = mock_conn.execute.call_args
+        args, _ = mock_conn.cursor.return_value.execute.call_args
         assert "SELECT description FROM doc_cache" in args[0]
         assert args[1] == ("p1", "prof1", "my_model", "my_col")
 
     @patch("duckdb.connect")
-    async def test_cleanup_db_duckdb(self, mock_connect):
+    def test_cleanup_db_duckdb(self, mock_connect):
         mock_conn = MagicMock()
         mock_connect.return_value = mock_conn
         
         db = cli.DatabaseAdapter()
         db.type = 'duckdb'
-        await db.connect()
+        db.connect()
         
         # Mock input to return 'yes'
         with patch("builtins.input", return_value="yes"):
-            await cli.action_cleanup_db(db)
+            cli.action_cleanup_db(db)
             
             # Check Drop statements
             calls = mock_conn.execute.call_args_list

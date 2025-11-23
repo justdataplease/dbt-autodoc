@@ -55,22 +55,21 @@ class TestDbtConfigManipulator:
         assert 'description = "New description"' in updated_sql
         assert "materialized='table'" in updated_sql
 
-@pytest.mark.asyncio
 class TestResolveDescription:
     @pytest.fixture
     def mock_db(self):
         db = MagicMock()
-        db.get = AsyncMock()
-        db.save = AsyncMock()
+        db.get = MagicMock()
+        db.save = MagicMock()
         return db
 
-    async def test_resolve_keep_human_written(self, mock_db):
+    def test_resolve_keep_human_written(self, mock_db):
         # Scenario: Description exists and does not have AI tag
         current_desc = "Human written description"
         model_name = "my_model"
         col_name = "my_col"
         
-        result = await cli.resolve_description(current_desc, model_name, col_name, mock_db, use_ai=True)
+        result = cli.resolve_description(current_desc, model_name, col_name, mock_db, use_ai=True)
         
         assert result == current_desc
         mock_db.save.assert_called_with(model_name, col_name, current_desc)
@@ -78,7 +77,7 @@ class TestResolveDescription:
         # We can't easily verify ask_gemini wasn't called unless we mock it too, 
         # but checking logic flow implies it returns early.
 
-    async def test_resolve_restore_from_db_if_human(self, mock_db):
+    def test_resolve_restore_from_db_if_human(self, mock_db):
         # Scenario: Description is missing, but DB has a human version
         current_desc = None
         model_name = "my_model"
@@ -87,12 +86,12 @@ class TestResolveDescription:
         
         mock_db.get.return_value = cached_desc
         
-        result = await cli.resolve_description(current_desc, model_name, col_name, mock_db, use_ai=True)
+        result = cli.resolve_description(current_desc, model_name, col_name, mock_db, use_ai=True)
         
         assert result == cached_desc
 
-    @patch('dbt_autodoc.cli.ask_gemini', new_callable=AsyncMock)
-    async def test_resolve_generate_ai(self, mock_ask_gemini, mock_db):
+    @patch('dbt_autodoc.cli.ask_gemini', new_callable=MagicMock)
+    def test_resolve_generate_ai(self, mock_ask_gemini, mock_db):
         # Scenario: Description missing, nothing in cache (or cache is AI but we force regen logic? No, see logic)
         # Logic says: 
         # 1. Keep Human -> No
@@ -107,7 +106,7 @@ class TestResolveDescription:
         mock_db.get.return_value = None
         mock_ask_gemini.return_value = "AI generated description (ai_generated)"
         
-        result = await cli.resolve_description(current_desc, model_name, col_name, mock_db, use_ai=True)
+        result = cli.resolve_description(current_desc, model_name, col_name, mock_db, use_ai=True)
         
         assert result == "AI generated description (ai_generated)"
         mock_db.save.assert_called_with(model_name, col_name, result)

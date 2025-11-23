@@ -6,7 +6,8 @@ import subprocess
 import argparse
 import re
 import sys
-import asyncio
+import threading
+import concurrent.futures
 from functools import wraps
 from dotenv import load_dotenv, dotenv_values, find_dotenv
 
@@ -27,10 +28,9 @@ def check_dependencies():
     except ImportError:
         missing.append("ruamel.yaml")
     
-    # Check for asyncpg if postgres is likely to be used, but we'll soft check later or here?
-    # The user specifically asked to make postgres async.
+    # Check for psycopg2 if postgres is used
     try:
-        import asyncpg
+        import psycopg2
     except ImportError:
         pass # We will check this when connecting if postgres is selected
 
@@ -48,9 +48,11 @@ import google.generativeai as genai
 from ruamel.yaml import YAML, YAMLError
 from ruamel.yaml.scalarstring import DoubleQuotedScalarString
 try:
-    import asyncpg
+    import psycopg2
+    from psycopg2 import pool as psycopg2_pool
 except ImportError:
-    asyncpg = None
+    psycopg2 = None
+    psycopg2_pool = None
 
 
 # --- 2. SETUP & CONFIG ---
@@ -138,10 +140,6 @@ yaml.width = 4096
 # Global Model Placeholder
 model = None
 
-# Semaphore for concurrency control
-concurrency_sem = None
-
-
 # --- 3. DATABASE ADAPTER ---
 
 def get_current_user():
@@ -151,17 +149,19 @@ def get_current_user():
 class DatabaseAdapter:
     def __init__(self, project_info=None):
         self.conn = None # For DuckDB
-        self.pool = None # For Postgres
+        self.pg_conn = None # For Postgres (single connection or pool? simple conn for now, threading safe?)
+        # psycopg2 connections are thread safe, cursors are not shared across threads usually
         self.type = DB_TYPE
         self.project_name = project_info.get("name", "unknown") if project_info else "unknown"
         self.profile_name = project_info.get("profile", "unknown") if project_info else "unknown"
+        self._lock = threading.Lock() # Lock for DuckDB or generic safety if needed
 
-    async def connect(self):
+    def connect(self):
         try:
             if self.type == 'postgres':
-                if not asyncpg:
-                    print("❌ DB Type is 'postgres' but 'asyncpg' is not installed.")
-                    print("   pip install asyncpg")
+                if not psycopg2:
+                    print("❌ DB Type is 'postgres' but 'psycopg2' is not installed.")
+                    print("   pip install psycopg2-binary")
                     sys.exit(1)
 
                 postgres_url = get_env_var('POSTGRES_URL')
@@ -172,7 +172,8 @@ class DatabaseAdapter:
                     else:
                         raise ValueError("POSTGRES_URL environment variable is missing and no .env file found.")
                 
-                self.pool = await asyncpg.create_pool(postgres_url)
+                self.pg_conn = psycopg2.connect(postgres_url)
+                self.pg_conn.autocommit = True
             else:
                 self.conn = duckdb.connect(DUCKDB_PATH)
         except Exception as e:
@@ -182,7 +183,7 @@ class DatabaseAdapter:
             print(f"   Error details: {e}")
             sys.exit(1)
 
-    async def init_table(self):
+    def init_table(self):
         q_cache_pg = """
             CREATE TABLE IF NOT EXISTS doc_cache
             (
@@ -218,15 +219,14 @@ class DatabaseAdapter:
         for attempt in range(2):
             try:
                 if self.type == 'postgres':
-                    async with self.pool.acquire() as conn:
-                        await conn.execute(q_cache_pg)
-                        await conn.execute(q_log_pg)
+                    with self.pg_conn.cursor() as cur:
+                        cur.execute(q_cache_pg)
+                        cur.execute(q_log_pg)
                 else:
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(None, lambda: self.conn.execute(q_cache_duck))
-                    await loop.run_in_executor(None, lambda: self.conn.execute(q_log_duck))
+                    self.conn.execute(q_cache_duck)
+                    self.conn.execute(q_log_duck)
                 
-                if await self.migrate_schema():
+                if self.migrate_schema():
                     print("♻️  Schema mismatch detected & handled. Re-initializing tables...")
                     continue # Retry create after drop
                 break # Done if no migration needed or handled
@@ -235,7 +235,7 @@ class DatabaseAdapter:
                 print("   If you have an old database schema, you might need to run with --cleanup-db.")
                 sys.exit(1)
 
-    async def migrate_schema(self):
+    def migrate_schema(self):
         # Simplified migration: If critical columns missing, DROP tables to reset.
         try:
             tables = ["doc_cache", "doc_cache_log"]
@@ -246,18 +246,16 @@ class DatabaseAdapter:
             for table in tables:
                 existing_cols = []
                 if self.type == 'postgres':
-                    async with self.pool.acquire() as conn:
-                        rows = await conn.fetch(f"SELECT column_name FROM information_schema.columns WHERE table_name = '{table}'")
-                        existing_cols = [row['column_name'] for row in rows]
+                    with self.pg_conn.cursor() as cur:
+                        cur.execute(f"SELECT column_name FROM information_schema.columns WHERE table_name = '{table}'")
+                        rows = cur.fetchall()
+                        existing_cols = [row[0] for row in rows]
                 else:
-                    loop = asyncio.get_running_loop()
-                    def _check_cols():
-                        try:
-                            info = self.conn.execute(f"PRAGMA table_info('{table}')").fetchall()
-                            return [col[1] for col in info]
-                        except:
-                            return []
-                    existing_cols = await loop.run_in_executor(None, _check_cols)
+                    try:
+                        info = self.conn.execute(f"PRAGMA table_info('{table}')").fetchall()
+                        existing_cols = [col[1] for col in info]
+                    except:
+                        existing_cols = []
                 
                 if not existing_cols: continue # Table doesn't exist yet (handled by init)
 
@@ -269,7 +267,7 @@ class DatabaseAdapter:
                 if needs_reset: break
 
             if needs_reset:
-                await action_cleanup_db(self)
+                action_cleanup_db(self)
                 return True # Signal to re-init
 
             return False
@@ -278,80 +276,79 @@ class DatabaseAdapter:
             print(f"⚠️  Migration Check Warning: {e}")
             return False
 
-    async def get(self, model, col):
+    def get(self, model, col):
         try:
             if self.type == 'duckdb':
                 q = "SELECT description FROM doc_cache WHERE dbt_project_name = ? AND dbt_profile_name = ? AND model_name = ? AND column_name = ?"
                 params = (self.project_name, self.profile_name, model, col)
-                
-                def _fetch():
-                    res = self.conn.execute(q, params).fetchone()
-                    return res[0] if res else None
-
-                loop = asyncio.get_running_loop()
-                return await loop.run_in_executor(None, _fetch)
+                # Use cursor for thread safety
+                res = self.conn.cursor().execute(q, params).fetchone()
+                return res[0] if res else None
             else:
-                q = "SELECT description FROM doc_cache WHERE dbt_project_name = $1 AND dbt_profile_name = $2 AND model_name = $3 AND column_name = $4"
-                async with self.pool.acquire() as conn:
-                    val = await conn.fetchval(q, self.project_name, self.profile_name, model, col)
-                    return val
+                q = "SELECT description FROM doc_cache WHERE dbt_project_name = %s AND dbt_profile_name = %s AND model_name = %s AND column_name = %s"
+                with self.pg_conn.cursor() as cur:
+                    cur.execute(q, (self.project_name, self.profile_name, model, col))
+                    res = cur.fetchone()
+                    return res[0] if res else None
         except Exception as e:
             print(f"⚠️  DB Read Error ({model}.{col}): {e}")
             return None
 
-    async def save(self, model, col, description):
+    def save(self, model, col, description):
         if not description: return
         try:
             clean_desc = str(description).strip('"')
-            old_desc = await self.get(model, col)
+            old_desc = self.get(model, col)
             user = get_current_user()
             is_human = AI_TAG not in clean_desc
             
             # Only log if there is a change
             if old_desc != clean_desc:
-                await self.log_change(model, col, old_desc, clean_desc, user, is_human)
+                self.log_change(model, col, old_desc, clean_desc, user, is_human)
 
             if self.type == 'postgres':
                 q = """
                     INSERT INTO doc_cache (dbt_project_name, dbt_profile_name, model_name, column_name, description, user_name, is_human, updated_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
                     ON CONFLICT (dbt_project_name, dbt_profile_name, model_name, column_name)
                     DO UPDATE SET description = EXCLUDED.description, user_name = EXCLUDED.user_name, is_human = EXCLUDED.is_human, updated_at = CURRENT_TIMESTAMP
                     """
-                async with self.pool.acquire() as conn:
-                    await conn.execute(q, self.project_name, self.profile_name, model, col, clean_desc, user, is_human)
+                with self.pg_conn.cursor() as cur:
+                    cur.execute(q, (self.project_name, self.profile_name, model, col, clean_desc, user, is_human))
             else:
                 q = """
                     INSERT OR REPLACE INTO doc_cache (dbt_project_name, dbt_profile_name, model_name, column_name, description, user_name, is_human, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 """
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, lambda: self.conn.execute(q, (self.project_name, self.profile_name, model, col, clean_desc, user, is_human)))
+                # Use cursor for thread safety
+                self.conn.cursor().execute(q, (self.project_name, self.profile_name, model, col, clean_desc, user, is_human))
         except Exception as e:
             print(f"⚠️  DB Save Error ({model}.{col}): {e}")
 
-    async def log_change(self, model, col, old_desc, new_desc, user, is_human):
+    def log_change(self, model, col, old_desc, new_desc, user, is_human):
         try:
             if self.type == 'postgres':
                 q = """
                     INSERT INTO doc_cache_log (dbt_project_name, dbt_profile_name, model_name, column_name, old_description, new_description, user_name, is_human, changed_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
                     """
-                async with self.pool.acquire() as conn:
-                    await conn.execute(q, self.project_name, self.profile_name, model, col, old_desc, new_desc, user, is_human)
+                with self.pg_conn.cursor() as cur:
+                    cur.execute(q, (self.project_name, self.profile_name, model, col, old_desc, new_desc, user, is_human))
             else:
                 q = """
                     INSERT INTO doc_cache_log (dbt_project_name, dbt_profile_name, model_name, column_name, old_description, new_description, user_name, is_human, changed_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 """
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, lambda: self.conn.execute(q, (self.project_name, self.profile_name, model, col, old_desc, new_desc, user, is_human)))
+                self.conn.cursor().execute(q, (self.project_name, self.profile_name, model, col, old_desc, new_desc, user, is_human))
         except Exception as e:
             print(f"⚠️  DB Log Error ({model}.{col}): {e}")
 
-    async def close(self):
-        if self.type == 'postgres' and self.pool:
-            await self.pool.close()
+    def close(self):
+        if self.type == 'postgres' and self.pg_conn:
+            try:
+                self.pg_conn.close()
+            except:
+                pass
         elif self.type == 'duckdb' and self.conn:
             try:
                 self.conn.close()
@@ -452,7 +449,7 @@ class DbtConfigManipulator:
 
 # --- 4. AI HELPER ---
 
-async def ask_gemini(model_name, target_name, is_table=False, table_context=None, sql_content=None, show_prompt=False):
+def ask_gemini(model_name, target_name, is_table=False, table_context=None, sql_content=None, show_prompt=False):
     if not model:
         return None
 
@@ -463,6 +460,10 @@ async def ask_gemini(model_name, target_name, is_table=False, table_context=None
     if is_table and sql_content:
         safe_sql = sql_content[:15000]
         sql_block = f"\n    SQL Source Code:\n    ```sql\n{safe_sql}\n    ```\n"
+    elif sql_content:
+        # For columns, we also include the model SQL if available
+        safe_sql = sql_content[:15000]
+        sql_block = f"\n    Model SQL Source Code:\n    ```sql\n{safe_sql}\n    ```\n"
 
     prompt = f"""
     You are a Data Dictionary Editor. Your goal is to write technical, dry, and precise definitions.
@@ -498,13 +499,8 @@ async def ask_gemini(model_name, target_name, is_table=False, table_context=None
         print("---------------------------------------------------\n")
 
     try:
-        if concurrency_sem:
-            async with concurrency_sem:
-                print(f"🤖 Asking AI for {model_name} -> {target_name}...")
-                response = await model.generate_content_async(prompt)
-        else:
-            print(f"🤖 Asking AI for {model_name} -> {target_name}...")
-            response = await model.generate_content_async(prompt)
+        print(f"🤖 Asking AI for {model_name} -> {target_name}...")
+        response = model.generate_content(prompt)
             
         if not response.text:
             print("⚠️  AI returned empty text (possibly safety filtered).")
@@ -519,21 +515,21 @@ async def ask_gemini(model_name, target_name, is_table=False, table_context=None
 
 # --- 5. CENTRAL LOGIC ---
 
-async def resolve_description(current_desc, model_name, col_name, db, use_ai, is_table=False, table_context=None, sql_content=None, show_prompt=False):
+def resolve_description(current_desc, model_name, col_name, db, use_ai, is_table=False, table_context=None, sql_content=None, show_prompt=False):
     current_desc_str = str(current_desc) if current_desc else ""
 
     # 1. Keep Human Written
     if current_desc_str and AI_TAG not in current_desc_str:
-        await db.save(model_name, col_name, current_desc_str)
+        db.save(model_name, col_name, current_desc_str)
         return current_desc_str
 
     # 2. Keep Existing AI
     if current_desc_str and AI_TAG in current_desc_str:
-        await db.save(model_name, col_name, current_desc_str)
+        db.save(model_name, col_name, current_desc_str)
         return current_desc_str
 
     # 3. Restore from DB
-    cached_desc = await db.get(model_name, col_name)
+    cached_desc = db.get(model_name, col_name)
     if cached_desc:
         is_human_cached = AI_TAG not in cached_desc
 
@@ -541,16 +537,17 @@ async def resolve_description(current_desc, model_name, col_name, db, use_ai, is
             print(f"💾 Restored Human Description from DB: {model_name}.{col_name}")
             return cached_desc
         
-        if not use_ai:
-            print(f"💾 Restored AI Description from DB: {model_name}.{col_name}")
-            return cached_desc
+        # Fix: Always restore AI description if found in DB (even if use_ai=True)
+        # to prevent unnecessary re-generation.
+        print(f"💾 Restored AI Description from DB: {model_name}.{col_name}")
+        return cached_desc
 
     # 4. Ask AI
     if use_ai:
-        ai_text = await ask_gemini(model_name, col_name, is_table, table_context, sql_content, show_prompt)
+        ai_text = ask_gemini(model_name, col_name, is_table, table_context, sql_content, show_prompt)
         if ai_text:
-            await db.save(model_name, col_name, ai_text)
-            # time.sleep(1) # Removed in favor of concurrency limits if needed, or let semaphore handle it
+            db.save(model_name, col_name, ai_text)
+            print(f"✅ Saved AI Description for {model_name}.{col_name}")
             return ai_text
 
     return current_desc
@@ -581,7 +578,7 @@ def action_cleanup():
     print("✅ Cleanup done.")
 
 
-async def action_cleanup_db(db):
+def action_cleanup_db(db):
     print("\n⚠️  WARNING: This will delete 'doc_cache' and 'doc_cache_log' tables from the database.")
     print("   This action cannot be undone. Make sure to backup your existing data not to lose it.")
     try:
@@ -594,13 +591,12 @@ async def action_cleanup_db(db):
     print("🗑️  Dropping tables...")
     try:
         if db.type == 'postgres':
-            async with db.pool.acquire() as conn:
-                await conn.execute("DROP TABLE IF EXISTS doc_cache")
-                await conn.execute("DROP TABLE IF EXISTS doc_cache_log")
+            with db.pg_conn.cursor() as cur:
+                cur.execute("DROP TABLE IF EXISTS doc_cache")
+                cur.execute("DROP TABLE IF EXISTS doc_cache_log")
         else:
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, lambda: db.conn.execute("DROP TABLE IF EXISTS doc_cache"))
-            await loop.run_in_executor(None, lambda: db.conn.execute("DROP TABLE IF EXISTS doc_cache_log"))
+            db.conn.execute("DROP TABLE IF EXISTS doc_cache")
+            db.conn.execute("DROP TABLE IF EXISTS doc_cache_log")
         print("✅ Tables dropped.")
     except Exception as e:
         print(f"❌ Failed to drop tables: {e}")
@@ -616,14 +612,25 @@ def action_run_osmosis():
         return
 
     try:
-        subprocess.run(["dbt-osmosis", "yaml", "refactor"], check=True)
+        subprocess.run([
+            "dbt-osmosis", "yaml", "refactor", 
+            "--force-inherit-descriptions", 
+            "--use-unrendered-descriptions",
+            "--auto-apply"
+        ], check=True)
     except subprocess.CalledProcessError:
         print("❌ Error: dbt-osmosis returned non-zero exit code. Check your dbt project validity.")
     except Exception as e:
         print(f"❌ Unexpected error running dbt-osmosis: {e}")
 
 
-async def process_single_yaml_file(file_path, db, use_ai, show_prompt):
+def find_model_sql_path(model_name, base_dir):
+    # Try to find the SQL file for the model
+    search_pattern = os.path.join(base_dir, "**", f"{model_name}.sql")
+    files = glob.glob(search_pattern, recursive=True)
+    return files[0] if files else None
+
+def process_single_yaml_file(file_path, db, use_ai, show_prompt, executor, model_path_override=None):
     if "dbt_project.yml" in file_path or "dbt-autodoc.yml" in file_path: return
 
     try:
@@ -640,58 +647,59 @@ async def process_single_yaml_file(file_path, db, use_ai, show_prompt):
 
     changed = False
     
-    # We need to collect tasks for this file
-    tasks = []
-    
-    # Structure to hold context for applying results back
-    # List of (model_index, column_index, coroutine)
-    
-    try:
-        for m_idx, model_node in enumerate(data['models']):
-            m_name = model_node.get('name')
-            if not m_name: continue
+    # Base directory for searching SQL files
+    base_sql_dir = model_path_override if model_path_override else DBT_MODELS_DIR
 
-            # Context extraction - we await here because it's a DB read needed for context
-            table_desc_context = await db.get(m_name, TABLE_MARKER)
-            if table_desc_context and AI_TAG in table_desc_context:
-                table_desc_context = table_desc_context.replace(AI_TAG, "").strip()
+    # Iterate over models sequentially
+    for m_idx, model_node in enumerate(data['models']):
+        m_name = model_node.get('name')
+        if not m_name: continue
 
-            for c_idx, col in enumerate(model_node.get('columns', [])):
-                c_name = col.get('name')
+        # Context extraction - sync
+        table_desc_context = db.get(m_name, TABLE_MARKER)
+        if table_desc_context and AI_TAG in table_desc_context:
+            table_desc_context = table_desc_context.replace(AI_TAG, "").strip()
+
+        # Get SQL content for context
+        sql_content = None
+        sql_file = find_model_sql_path(m_name, base_sql_dir)
+        if sql_file:
+            try:
+                with open(sql_file, 'r', encoding='utf-8') as sf:
+                    sql_content = sf.read()
+            except Exception:
+                pass # Ignore errors reading SQL file
+
+        # Collect tasks for this model (columns)
+        futures = {}
+        for c_idx, col in enumerate(model_node.get('columns', [])):
+            c_name = col.get('name')
+            curr_desc = col.get('description')
+            
+            # Submit task
+            future = executor.submit(
+                resolve_description,
+                curr_desc, m_name, c_name, db, use_ai,
+                is_table=False,
+                table_context=table_desc_context,
+                sql_content=sql_content,
+                show_prompt=show_prompt
+            )
+            futures[future] = (m_idx, c_idx)
+
+        # Wait for all columns in this model to finish
+        for future in concurrent.futures.as_completed(futures):
+            _, c_idx = futures[future]
+            try:
+                res = future.result()
+                col = model_node['columns'][c_idx]
                 curr_desc = col.get('description')
                 
-                # Create task
-                coro = resolve_description(
-                    curr_desc, m_name, c_name, db, use_ai,
-                    is_table=False,
-                    table_context=table_desc_context,
-                    sql_content=None,
-                    show_prompt=show_prompt
-                )
-                tasks.append((m_idx, c_idx, coro))
-    except Exception as e:
-        print(f"❌ Error setting up tasks for {os.path.basename(file_path)}: {e}")
-        return
-
-    if not tasks:
-        return
-
-    # Run all tasks for this file
-    # Note: We process one file at a time in parallel internally, or we could parallelize across files.
-    # Parallelizing across columns within a file is good.
-    results = await asyncio.gather(*(t[2] for t in tasks))
-    
-    for i, res in enumerate(results):
-        m_idx, c_idx, _ = tasks[i]
-        
-        # Apply result
-        model_node = data['models'][m_idx]
-        col = model_node['columns'][c_idx]
-        curr_desc = col.get('description')
-        
-        if res and res != curr_desc:
-            col['description'] = DoubleQuotedScalarString(res)
-            changed = True
+                if res and res != curr_desc:
+                    col['description'] = DoubleQuotedScalarString(res)
+                    changed = True
+            except Exception as e:
+                print(f"❌ Error processing column in {m_name}: {e}")
 
     if changed:
         try:
@@ -700,24 +708,24 @@ async def process_single_yaml_file(file_path, db, use_ai, show_prompt):
         except Exception as e:
             print(f"❌ Failed to write back to {file_path}: {e}")
 
-async def action_process_yaml_columns(db, use_ai=False, show_prompt=False):
+def action_process_yaml_columns(db, use_ai=False, show_prompt=False, concurrency=10, model_path=None):
     print(f"\n📂 Processing YAML Columns (AI={use_ai})...")
-    yml_files = glob.glob(os.path.join(DBT_MODELS_DIR, "**/_*.yml"), recursive=True)
+    target_dir = model_path if model_path else DBT_MODELS_DIR
+    yml_files = glob.glob(os.path.join(target_dir, "**/_*.yml"), recursive=True)
 
     if not yml_files:
-        print(f"⚠️  No _*.yml files found in {DBT_MODELS_DIR}")
+        print(f"⚠️  No _*.yml files found in {target_dir}")
         return
 
-    # Process files concurrently? 
-    # Yes, but we need to be careful about file handles? Python handles are fine.
-    # Limit concurrency to avoid too many open files or too much DB pressure?
-    # Semaphore will limit AI calls. DB pool handles DB pressure.
+    # Process files sequentially to respect "not multiple tables concurrent" at top level
+    # Inside each file (if multiple tables, handled in process_single_yaml_file), we use executor for columns.
     
-    file_tasks = [process_single_yaml_file(f, db, use_ai, show_prompt) for f in yml_files]
-    await asyncio.gather(*file_tasks)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+        for f in yml_files:
+            process_single_yaml_file(f, db, use_ai, show_prompt, executor, model_path_override=model_path)
 
 
-async def process_single_sql_file(file_path, db, use_ai, show_prompt):
+def process_single_sql_file(file_path, db, use_ai, show_prompt):
     m_name = os.path.splitext(os.path.basename(file_path))[0]
 
     try:
@@ -729,7 +737,7 @@ async def process_single_sql_file(file_path, db, use_ai, show_prompt):
 
     curr_desc = DbtConfigManipulator.extract_description(content)
 
-    new_desc = await resolve_description(
+    new_desc = resolve_description(
         curr_desc, m_name, TABLE_MARKER, db, use_ai,
         is_table=True,
         table_context=None,
@@ -747,16 +755,23 @@ async def process_single_sql_file(file_path, db, use_ai, show_prompt):
             except Exception as e:
                 print(f"❌ Failed to write SQL {m_name}: {e}")
 
-async def action_process_sql_configs(db, use_ai=False, show_prompt=False):
+def action_process_sql_configs(db, use_ai=False, show_prompt=False, concurrency=10, model_path=None):
     print(f"\n📄 Processing SQL Model Configs (AI={use_ai})...")
-    sql_files = glob.glob(os.path.join(DBT_MODELS_DIR, "**/*.sql"), recursive=True)
+    target_dir = model_path if model_path else DBT_MODELS_DIR
+    sql_files = glob.glob(os.path.join(target_dir, "**/*.sql"), recursive=True)
 
     if not sql_files:
-        print(f"⚠️  No .sql files found in {DBT_MODELS_DIR}")
+        print(f"⚠️  No .sql files found in {target_dir}")
         return
-
-    tasks = [process_single_sql_file(f, db, use_ai, show_prompt) for f in sql_files]
-    await asyncio.gather(*tasks)
+    
+    # Process concurrently
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = [executor.submit(process_single_sql_file, f, db, use_ai, show_prompt) for f in sql_files]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                print(f"❌ Error processing SQL file: {e}")
 
 
 def validate_dbt_project():
@@ -779,8 +794,8 @@ def validate_dbt_project():
 
 # --- 7. MAIN ---
 
-async def async_main():
-    global model, concurrency_sem
+def main():
+    global model
     
     # Load environment variables from .env file (search up directories)
     load_dotenv(find_dotenv(usecwd=True))
@@ -796,7 +811,7 @@ async def async_main():
     """
 
     parser = argparse.ArgumentParser(
-        description="Automated DBT Documentation Generator using Google Gemini AI (Async)",
+        description="Automated DBT Documentation Generator using Google Gemini AI (Sync + Threads)",
         epilog=example_text,
         formatter_class=argparse.RawTextHelpFormatter
     )
@@ -808,11 +823,16 @@ async def async_main():
     parser.add_argument("--generate-docs-yml-ai", action="store_true", help="Run dbt-osmosis, sync YAML, and AI-generate column descriptions.")
     parser.add_argument("--generate-docs-config", action="store_true", help="Sync SQL config blocks (No AI). Saves manual edits to DB.")
     parser.add_argument("--generate-docs-config-ai", action="store_true", help="Sync SQL config blocks and AI-generate table descriptions.")
+    
+    parser.add_argument("--regenerate-yml", action="store_true", help="Only run dbt-osmosis to regenerate YAML files from dbt models (preserves descriptions).")
+    parser.add_argument("--generate-docs", action="store_true", help="Run full documentation flow (Tables -> Osmosis -> Columns) WITHOUT AI.")
+    parser.add_argument("--generate-docs-ai", action="store_true", help="Run full documentation flow (Tables -> Osmosis -> Columns) WITH AI.")
 
     parser.add_argument("--show-prompt", action="store_true", help="Print the prompt sent to AI for debugging")
     parser.add_argument("--gemini-api-key", type=str, help="Google Gemini API Key (overrides env var)")
     
-    parser.add_argument("--concurrency", type=int, default=None, help="Max concurrent AI/DB requests (default: 1). Note: concurrency is for postgres only")
+    parser.add_argument("--concurrency", type=int, default=None, help="Max concurrent threads (default: 10).")
+    parser.add_argument("--model-path", type=str, default=None, help="Specific directory to process (e.g. models/staging). Defaults to configured dbt_models_dir.")
 
     try:
         args = parser.parse_args()
@@ -821,7 +841,8 @@ async def async_main():
 
     # --- INITIALIZE AI MODEL ---
     api_key = args.gemini_api_key or get_env_var('GEMINI_API_KEY') or CFG.get('gemini_api_key')
-    use_ai = args.generate_docs_yml_ai or args.generate_docs_config_ai
+    # Determine if AI is needed
+    use_ai = args.generate_docs_yml_ai or args.generate_docs_config_ai or args.generate_docs_ai
 
     if api_key:
         try:
@@ -836,7 +857,7 @@ async def async_main():
         print("   Provide key via --gemini-api-key or GEMINI_API_KEY env var.")
         sys.exit(1)
 
-    # Initialize semaphore
+    # Concurrency
     concurrency_val = args.concurrency
     if concurrency_val is None:
         concurrency_val = CFG.get('concurrency', 10)
@@ -846,8 +867,6 @@ async def async_main():
     except (ValueError, TypeError):
         print(f"⚠️  Invalid concurrency value: {concurrency_val}. Using default 10.")
         concurrency = 10
-
-    concurrency_sem = asyncio.Semaphore(concurrency)
 
     # --- VALIDATION ---
     if not args.cleanup_yml and not args.cleanup_db:
@@ -859,70 +878,65 @@ async def async_main():
         return
 
     # --- RUNTIME ---
-    # We need project info for DB connection (schema) even if just cleaning up DB
-    # But if cleanup_db is used, maybe we don't enforce dbt_project.yml existence?
-    # However, DatabaseAdapter needs it. We can default to unknown if missing.
-    
     project_info = get_dbt_project_info()
     
     db = DatabaseAdapter(project_info)
-    await db.connect()
+    db.connect()
     
     if args.cleanup_db:
-        await action_cleanup_db(db)
-        await db.close()
+        action_cleanup_db(db)
+        db.close()
         return
 
-    await db.init_table()
+    db.init_table()
 
     try:
-        if args.generate_docs_yml or args.generate_docs_yml_ai:
+        # New Combined Flows
+        if args.regenerate_yml:
             action_run_osmosis()
-            await action_process_yaml_columns(db, use_ai=args.generate_docs_yml_ai, show_prompt=args.show_prompt)
 
-        if args.generate_docs_config or args.generate_docs_config_ai:
-            await action_process_sql_configs(db, use_ai=args.generate_docs_config_ai, show_prompt=args.show_prompt)
+        elif args.generate_docs:
+            # Full flow NO AI
+            # 1. Osmosis (Sync structure & inherit)
+            action_run_osmosis()
+            # 2. SQL Configs (Sync)
+            action_process_sql_configs(db, use_ai=False, show_prompt=args.show_prompt, concurrency=concurrency, model_path=args.model_path)
+            # 3. YAML Columns (Sync)
+            action_process_yaml_columns(db, use_ai=False, show_prompt=args.show_prompt, concurrency=concurrency, model_path=args.model_path)
+            # 4. Osmosis (Final check/format)
+            action_run_osmosis()
+            # 5. YAML Columns (Sync again - capturing inherited updates to DB)
+            action_process_yaml_columns(db, use_ai=False, show_prompt=args.show_prompt, concurrency=concurrency, model_path=args.model_path)
+
+        elif args.generate_docs_ai:
+            # Full flow WITH AI
+            # 1. Osmosis (Sync structure & inherit)
+            action_run_osmosis()
+            # 2. SQL Configs (Generate Table Descriptions)
+            action_process_sql_configs(db, use_ai=True, show_prompt=args.show_prompt, concurrency=concurrency, model_path=args.model_path)
+            # 3. YAML Columns (Generate Column Descriptions)
+            action_process_yaml_columns(db, use_ai=True, show_prompt=args.show_prompt, concurrency=concurrency, model_path=args.model_path)
+            # 4. Osmosis (Final check/format)
+            action_run_osmosis()
+            # 5. YAML Columns (Sync again - capturing inherited updates to DB)
+            action_process_yaml_columns(db, use_ai=False, show_prompt=args.show_prompt, concurrency=concurrency, model_path=args.model_path)
+
+        # Individual Flags (Original behavior)
+        else:
+            if args.generate_docs_yml or args.generate_docs_yml_ai:
+                action_run_osmosis()
+                action_process_yaml_columns(db, use_ai=args.generate_docs_yml_ai, show_prompt=args.show_prompt, concurrency=concurrency, model_path=args.model_path)
+
+            if args.generate_docs_config or args.generate_docs_config_ai:
+                action_process_sql_configs(db, use_ai=args.generate_docs_config_ai, show_prompt=args.show_prompt, concurrency=concurrency, model_path=args.model_path)
 
     except KeyboardInterrupt:
         print("\n🔴 Script interrupted by user. Exiting...")
     except Exception as e:
         print(f"\n❌ Unexpected crash: {e}")
     finally:
-        await db.close()
+        db.close()
         print("\n✨ Operation Complete.")
-
-def main():
-    # Workaround for Windows asyncio issue
-    if sys.platform == 'win32':
-        try:
-            from asyncio.proactor_events import _ProactorBasePipeTransport
-            
-            def silence_event_loop_closed(func):
-                @wraps(func)
-                def wrapper(*args, **kwargs):
-                    try:
-                        return func(*args, **kwargs)
-                    except RuntimeError as e:
-                        if str(e) != 'Event loop is closed':
-                            raise
-                return wrapper
-
-            _ProactorBasePipeTransport.__del__ = silence_event_loop_closed(_ProactorBasePipeTransport.__del__)
-        except ImportError:
-            pass
-
-    try:
-        asyncio.run(async_main())
-    except KeyboardInterrupt:
-        pass
-    except Exception as e:
-        print(f"❌ Fatal Error: {e}")
-        sys.exit(1)
-    
-    # Aggressive exit to prevent Windows asyncio shutdown errors
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os._exit(0)
 
 if __name__ == "__main__":
     main()
