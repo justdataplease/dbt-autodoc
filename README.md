@@ -60,9 +60,9 @@ For the best results, follow this step-by-step workflow to ensure accuracy and c
     ```
 
 6.  **Propagate & Save:**
-    Run osmosis again to apply inheritance rules to all the dbt project, then run the tool again to save the final state (including inherited descriptions) to the database.
+    Run inheritance rules on the entire dbt project, then run the tool again to save the final state (including inherited descriptions) to the database.
     ```bash
-    dbt-autodoc --regenerate-yml
+    dbt-autodoc --regenerate-yml-with-inheritance
     dbt-autodoc --generate-docs-yml-ai --model-path models/staging
     ```
 
@@ -92,13 +92,14 @@ It synthesizes all these inputs to write a concise, technical description.
 
 | Argument | Description |
 | :--- | :--- |
-| `--regenerate-yml` | **Structure Only.** Only runs `dbt-osmosis` to regenerate YAML files from dbt models. Does not sync to DB or call AI. |
+| `--regenerate-yml` | **Structure Only.** Regenerate YAML files from dbt models. Does not sync to DB or call AI. |
+| `--regenerate-yml-with-inheritance` | **Structure + Inheritance.** Regenerate YAML files with inheritance enabled. Use this to propagate descriptions from upstream models. |
 | `--model-path` | Restrict processing to a specific directory (e.g. `models/staging`). |
 | `--generate-docs-config-ai` | Generate table descriptions in `.sql` files using AI. |
 | `--generate-docs-yml-ai` | Generate column descriptions in `.yml` files using AI. |
 | `--generate-docs-config` | Sync `.sql` files from cache (no AI). |
 | `--generate-docs-yml` | Sync `.yml` files from cache (no AI). |
-| `--generate-docs-ai` | **🔥 Full Auto.** Runs the complete workflow: SQL generation, Osmosis sync, and YAML generation using AI. |
+| `--generate-docs-ai` | **🔥 Full Auto.** Runs the complete workflow: SQL generation, YAML sync, and YAML generation using AI. |
 | `--generate-docs` | **🔄 Full Sync.** Runs the complete workflow using only the database cache (no AI). |
 | `--cleanup-db` | **Reset Database.** Wipes the description cache and history. |
 | `--concurrency` | Max threads for AI/DB requests (default: 10). |

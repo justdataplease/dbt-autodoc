@@ -602,8 +602,8 @@ def action_cleanup_db(db):
         print(f"❌ Failed to drop tables: {e}")
 
 
-def action_run_osmosis():
-    print("\n🚀 Running dbt-osmosis yaml refactor...")
+def action_run_osmosis(with_inheritance=False):
+    print("\n🚀 Syncing YAML files...")
 
     from shutil import which
     if which('dbt-osmosis') is None:
@@ -612,12 +612,14 @@ def action_run_osmosis():
         return
 
     try:
-        subprocess.run([
-            "dbt-osmosis", "yaml", "refactor", 
-            "--force-inherit-descriptions", 
-            "--use-unrendered-descriptions",
+        cmd = [
+            "dbt-osmosis", "yaml", "refactor",
             "--auto-apply"
-        ], check=True)
+        ]
+        if with_inheritance:
+            cmd.extend(["--force-inherit-descriptions", "--use-unrendered-descriptions"])
+
+        subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError:
         print("❌ Error: dbt-osmosis returned non-zero exit code. Check your dbt project validity.")
     except Exception as e:
@@ -824,9 +826,10 @@ def main():
     parser.add_argument("--generate-docs-config", action="store_true", help="Sync SQL config blocks (No AI). Saves manual edits to DB.")
     parser.add_argument("--generate-docs-config-ai", action="store_true", help="Sync SQL config blocks and AI-generate table descriptions.")
     
-    parser.add_argument("--regenerate-yml", action="store_true", help="Only run dbt-osmosis to regenerate YAML files from dbt models (preserves descriptions).")
-    parser.add_argument("--generate-docs", action="store_true", help="Run full documentation flow (Tables -> Osmosis -> Columns) WITHOUT AI.")
-    parser.add_argument("--generate-docs-ai", action="store_true", help="Run full documentation flow (Tables -> Osmosis -> Columns) WITH AI.")
+    parser.add_argument("--regenerate-yml", action="store_true", help="Regenerate YAML files from dbt models (preserves descriptions).")
+    parser.add_argument("--regenerate-yml-with-inheritance", action="store_true", help="Regenerate YAML files with description inheritance enabled.")
+    parser.add_argument("--generate-docs", action="store_true", help="Run full documentation flow (Tables -> Sync -> Columns) WITHOUT AI.")
+    parser.add_argument("--generate-docs-ai", action="store_true", help="Run full documentation flow (Tables -> Sync -> Columns) WITH AI.")
 
     parser.add_argument("--show-prompt", action="store_true", help="Print the prompt sent to AI for debugging")
     parser.add_argument("--gemini-api-key", type=str, help="Google Gemini API Key (overrides env var)")
@@ -893,38 +896,41 @@ def main():
     try:
         # New Combined Flows
         if args.regenerate_yml:
-            action_run_osmosis()
+            action_run_osmosis(with_inheritance=False)
+
+        elif args.regenerate_yml_with_inheritance:
+            action_run_osmosis(with_inheritance=True)
 
         elif args.generate_docs:
             # Full flow NO AI
             # 1. Osmosis (Sync structure & inherit)
-            action_run_osmosis()
+            action_run_osmosis(with_inheritance=False)
             # 2. SQL Configs (Sync)
             action_process_sql_configs(db, use_ai=False, show_prompt=args.show_prompt, concurrency=concurrency, model_path=args.model_path)
             # 3. YAML Columns (Sync)
             action_process_yaml_columns(db, use_ai=False, show_prompt=args.show_prompt, concurrency=concurrency, model_path=args.model_path)
             # 4. Osmosis (Final check/format)
-            action_run_osmosis()
+            action_run_osmosis(with_inheritance=False)
             # 5. YAML Columns (Sync again - capturing inherited updates to DB)
             action_process_yaml_columns(db, use_ai=False, show_prompt=args.show_prompt, concurrency=concurrency, model_path=args.model_path)
 
         elif args.generate_docs_ai:
             # Full flow WITH AI
             # 1. Osmosis (Sync structure & inherit)
-            action_run_osmosis()
+            action_run_osmosis(with_inheritance=False)
             # 2. SQL Configs (Generate Table Descriptions)
             action_process_sql_configs(db, use_ai=True, show_prompt=args.show_prompt, concurrency=concurrency, model_path=args.model_path)
             # 3. YAML Columns (Generate Column Descriptions)
             action_process_yaml_columns(db, use_ai=True, show_prompt=args.show_prompt, concurrency=concurrency, model_path=args.model_path)
             # 4. Osmosis (Final check/format)
-            action_run_osmosis()
+            action_run_osmosis(with_inheritance=False)
             # 5. YAML Columns (Sync again - capturing inherited updates to DB)
             action_process_yaml_columns(db, use_ai=False, show_prompt=args.show_prompt, concurrency=concurrency, model_path=args.model_path)
 
         # Individual Flags (Original behavior)
         else:
             if args.generate_docs_yml or args.generate_docs_yml_ai:
-                action_run_osmosis()
+                action_run_osmosis(with_inheritance=False)
                 action_process_yaml_columns(db, use_ai=args.generate_docs_yml_ai, show_prompt=args.show_prompt, concurrency=concurrency, model_path=args.model_path)
 
             if args.generate_docs_config or args.generate_docs_config_ai:
