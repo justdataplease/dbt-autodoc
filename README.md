@@ -32,9 +32,9 @@
 For the best results, follow this step-by-step workflow to ensure accuracy and control:
 
 1.  **Preparation:**
-    Update your dbt project and context.
+    Update your dbt project, generate the manifest, and context.
     ```bash
-    dbt run
+    dbt run && dbt docs generate
     # Edit dbt-autodoc.yml with company_context
     ```
 

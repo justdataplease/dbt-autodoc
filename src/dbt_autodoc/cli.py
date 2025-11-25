@@ -8,6 +8,7 @@ import re
 import sys
 import threading
 import concurrent.futures
+import json
 from functools import wraps
 from dotenv import load_dotenv, dotenv_values, find_dotenv
 
@@ -139,6 +140,7 @@ yaml.width = 4096
 
 # Global Model Placeholder
 model = None
+manifest_data = None # Cache for manifest
 
 # --- 3. DATABASE ADAPTER ---
 
@@ -446,10 +448,95 @@ class DbtConfigManipulator:
             print(f"❌ parsing error in SQL update: {e}")
             return sql_content
 
+# --- 4. MANIFEST / UPSTREAM EXTENSION ---
+def load_manifest(manifest_path="target/manifest.json"):
+    """Loads dbt manifest.json to understand the DAG."""
+    global manifest_data
+    if manifest_data:
+        return manifest_data
 
-# --- 4. AI HELPER ---
+    if not os.path.exists(manifest_path):
+        print(f"⚠️  Manifest file not found at {manifest_path}.")
+        print("   Upstream context (dependencies) will be unavailable.")
+        print("   💡 Tip: Run 'dbt compile' or 'dbt docs generate' to create the manifest file.")
+        return None
+    
+    try:
+        with open(manifest_path, 'r', encoding='utf-8') as f:
+            manifest_data = json.load(f)
+            return manifest_data
+    except Exception as e:
+        print(f"❌ Failed to load manifest: {e}")
+        return None
 
-def ask_gemini(model_name, target_name, is_table=False, table_context=None, sql_content=None, show_prompt=False):
+def get_upstream_models(model_name, manifest=None, project_name=None):
+    """
+    Finds direct upstream parents (depends_on) for a given model.
+    Returns a list of parent model names.
+    """
+    if not manifest:
+        manifest = load_manifest()
+    
+    if not manifest or 'nodes' not in manifest:
+        return []
+
+    # Find the node for this model
+    # Nodes in manifest are keyed like 'model.project_name.model_name'
+    target_node_id = None
+    target_node = None
+    
+    # Strategy 1: strict match if project_name is known
+    if project_name:
+        # Standard dbt node ID format: model.<project_name>.<model_name>
+        # Note: Depending on dbt version/config, it might vary, but this is standard.
+        candidate_id = f"model.{project_name}.{model_name}"
+        if candidate_id in manifest['nodes']:
+            target_node = manifest['nodes'][candidate_id]
+
+    # Strategy 2: Search by name if not found yet
+    if not target_node:
+        for node_id, node in manifest['nodes'].items():
+            if node.get('name') == model_name and node.get('resource_type') == 'model':
+                # Optional: If we have a project name, ensure it matches
+                if project_name and node.get('package_name') != project_name:
+                    continue
+                target_node = node
+                break
+            
+    if not target_node:
+        return []
+    
+    # Get depends_on nodes
+    depends_on = target_node.get('depends_on', {}).get('nodes', [])
+    
+    # Filter for models only (exclude sources/macros if desired, or keep them)
+    # We usually want models or sources to give context.
+    
+    upstream_info = []
+    
+    for parent_id in depends_on:
+        parent_node = manifest['nodes'].get(parent_id)
+        if not parent_node:
+            # Maybe it's a source?
+            if parent_id in manifest.get('sources', {}):
+                 parent_node = manifest['sources'][parent_id]
+        
+        if parent_node:
+            name = parent_node.get('name')
+            desc = parent_node.get('description', '')
+            resource_type = parent_node.get('resource_type')
+            upstream_info.append({
+                "name": name,
+                "type": resource_type,
+                "description": desc
+            })
+            
+    return upstream_info
+
+
+# --- 5. AI HELPER ---
+
+def ask_gemini(model_name, target_name, is_table=False, table_context=None, sql_content=None, show_prompt=False, project_name=None):
     if not model:
         return None
 
@@ -464,7 +551,17 @@ def ask_gemini(model_name, target_name, is_table=False, table_context=None, sql_
         # For columns, we also include the model SQL if available
         safe_sql = sql_content[:15000]
         sql_block = f"\n    Model SQL Source Code:\n    ```sql\n{safe_sql}\n    ```\n"
-
+    
+    # --- UPSTREAM CONTEXT ADDITION ---
+    upstream_context_str = ""
+    # Always include upstream context for both tables and columns
+    upstream = get_upstream_models(model_name, project_name=project_name)
+    if upstream:
+        upstream_context_str = "\n    UPSTREAM MODELS (Dependencies):\n"
+        for u in upstream:
+            desc = u['description'] if u['description'] else "No description"
+            upstream_context_str += f"    - {u['type']} {u['name']}: {desc}\n"
+    
     prompt = f"""
     You are a Data Dictionary Editor. Your goal is to write technical, dry, and precise definitions.
 
@@ -474,6 +571,7 @@ def ask_gemini(model_name, target_name, is_table=False, table_context=None, sql_
     - Type: {entity_type}
     - Object Name: {target_name}
     {context_block}
+    {upstream_context_str}
     {sql_block}
 
     STRICT WRITING RULES:
@@ -513,7 +611,7 @@ def ask_gemini(model_name, target_name, is_table=False, table_context=None, sql_
         return None
 
 
-# --- 5. CENTRAL LOGIC ---
+# --- 6. CENTRAL LOGIC ---
 
 def resolve_description(current_desc, model_name, col_name, db, use_ai, is_table=False, table_context=None, sql_content=None, show_prompt=False):
     current_desc_str = str(current_desc) if current_desc else ""
@@ -544,7 +642,7 @@ def resolve_description(current_desc, model_name, col_name, db, use_ai, is_table
 
     # 4. Ask AI
     if use_ai:
-        ai_text = ask_gemini(model_name, col_name, is_table, table_context, sql_content, show_prompt)
+        ai_text = ask_gemini(model_name, col_name, is_table, table_context, sql_content, show_prompt, project_name=db.project_name)
         if ai_text:
             db.save(model_name, col_name, ai_text)
             print(f"✅ Saved AI Description for {model_name}.{col_name}")
@@ -553,7 +651,7 @@ def resolve_description(current_desc, model_name, col_name, db, use_ai, is_table
     return current_desc
 
 
-# --- 6. ACTIONS ---
+# --- 7. ACTIONS ---
 
 def action_cleanup():
     pattern = "**/_*.yml"
@@ -813,7 +911,7 @@ def main():
     """
 
     parser = argparse.ArgumentParser(
-        description="Automated DBT Documentation Generator using Google Gemini AI (Sync + Threads)",
+        description="Automated DBT Documentation Generator using Google Gemini AI (Sync + Threads + Upstream Context)",
         epilog=example_text,
         formatter_class=argparse.RawTextHelpFormatter
     )
@@ -892,6 +990,9 @@ def main():
         return
 
     db.init_table()
+
+    # Attempt to load manifest once
+    load_manifest()
 
     try:
         # New Combined Flows
