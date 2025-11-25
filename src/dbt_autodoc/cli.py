@@ -51,6 +51,13 @@ from ruamel.yaml import YAML, YAMLError
 from ruamel.yaml.scalarstring import DoubleQuotedScalarString
 from ruamel.yaml.comments import CommentedMap, CommentedSeq
 
+try:
+    import psycopg2
+    from psycopg2 import pool as psycopg2_pool
+except ImportError:
+    psycopg2 = None
+    psycopg2_pool = None
+
 
 # --- 2. SETUP & CONFIG ---
 
@@ -640,23 +647,11 @@ def _reorder_map_keys(node: CommentedMap, preferred_order: list):
     if not isinstance(node, CommentedMap):
         return
 
-    # Store original items with their comments
-    items_with_comments = []
+    # Store original items
+    items = []
     for key in list(node.keys()):
         value = node.pop(key)
-        # ruamel.yaml stores comments in various places. This is a best effort.
-        # It's challenging to reliably extract *all* comment types associated with a key
-        # without deep knowledge of ruamel.yaml's internal comment structure.
-        # This approach tries to capture comments that might be 'before' the key or 'eol' (end-of-line).
-        
-        # Get comment before the key
-        pre_comment = node.yaml_get_comment_before_after_key(key, _info=True)
-        before_comment = pre_comment[0][2].split('\n') if pre_comment and pre_comment[0] and pre_comment[0][2] else []
-        
-        # Get end-of-line comment
-        eol_comment = node.yaml_get_item_comment(key)
-        
-        items_with_comments.append({'key': key, 'value': value, 'before': before_comment, 'eol': eol_comment})
+        items.append({'key': key, 'value': value})
     
     # Sort items based on preferred_order, then alphabetically for remaining
     def sort_key_func(item):
@@ -666,22 +661,13 @@ def _reorder_map_keys(node: CommentedMap, preferred_order: list):
         except ValueError:
             return (len(preferred_order), key) # Place unspecified keys at the end, then alpha
 
-    items_with_comments.sort(key=sort_key_func)
+    items.sort(key=sort_key_func)
 
-    # Re-insert into the node, attempting to restore comments
-    for item in items_with_comments:
+    # Re-insert into the node
+    for item in items:
         key = item['key']
         value = item['value']
-        
-        # Insert key-value pair
         node[key] = value
-
-        # Re-attach comments
-        if item['before']:
-            # For multiline comments, ruamel.yaml expects a single string with newlines
-            node.yaml_set_comment_before_after_key(key, before=''.join(item['before']))
-        if item['eol']:
-            node.yaml_set_comment_before_after_key(key, after=item['eol'])
 
 
 def process_single_yaml_file(file_path, db, use_ai, show_prompt, executor, model_path_override=None, scope='both'):

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dbt-autodoc"
-version = "1.0.20"
+version = "1.0.21"
 description = "Automated documentation generator for dbt projects using Google Gemini AI"
 readme = "README.md"
 authors = [
