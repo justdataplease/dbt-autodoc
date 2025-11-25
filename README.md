@@ -44,26 +44,26 @@ For the best results, follow this step-by-step workflow to ensure accuracy and c
     dbt-autodoc --regenerate-yml
     ```
 
-3.  **Generate Table Descriptions (YAML):**
+3.  **Generate Model Descriptions (YAML):**
     Generate AI descriptions for your models (tables/views).
     ```bash
-    dbt-autodoc --generate-docs-config-ai --model-path models/staging
+    dbt-autodoc --generate-docs-model-ai --model-path models/staging
     ```
 
 4.  **Manual Review (Important):**
     Open your YAML files. Review the structure and any existing descriptions. If you manually update a description here, it will be protected from AI overwrites in the next step.
 
-5.  **Generate Column Descriptions (YAML):**
+5.  **Generate Model Column Descriptions (YAML):**
     Use AI to fill in the missing column descriptions.
     ```bash
-    dbt-autodoc --generate-docs-yml-ai --model-path models/staging
+    dbt-autodoc --generate-docs-model-columns-ai --model-path models/staging
     ```
 
 6.  **Propagate & Save:**
     Run inheritance rules on the entire dbt project, then run the tool again to save the final state (including inherited descriptions) to the database.
     ```bash
     dbt-autodoc --regenerate-yml-with-inheritance
-    dbt-autodoc --generate-docs-yml-ai --model-path models/staging
+    dbt-autodoc --generate-docs-model-columns-ai --model-path models/staging
     ```
 
 7.  **Next Layer:**
@@ -95,11 +95,11 @@ It synthesizes all these inputs to write a concise, technical description.
 | `--regenerate-yml` | **Structure Only.** Regenerate YAML files from dbt models. Does not sync to DB or call AI. |
 | `--regenerate-yml-with-inheritance` | **Structure + Inheritance.** Regenerate YAML files with inheritance enabled. Use this to propagate descriptions from upstream models. |
 | `--model-path` | Restrict processing to a specific directory (e.g. `models/staging`). |
-| `--generate-docs-config-ai` | Generate table descriptions in `.yml` files using AI. |
-| `--generate-docs-yml-ai` | Generate column descriptions in `.yml` files using AI. |
-| `--generate-docs-config` | Sync table descriptions in `.yml` files from cache (no AI). |
-| `--generate-docs-yml` | Sync column descriptions in `.yml` files from cache (no AI). |
-| `--generate-docs-ai` | **🔥 Full Auto.** Runs the complete workflow: Table generation, YAML sync, and Column generation using AI. |
+| `--generate-docs-model-ai` | Generate model descriptions in `.yml` files using AI. |
+| `--generate-docs-model-columns-ai` | Generate column descriptions in `.yml` files using AI. |
+| `--generate-docs-model` | Sync model descriptions in `.yml` files from cache (no AI). |
+| `--generate-docs-model-columns` | Sync column descriptions in `.yml` files from cache (no AI). |
+| `--generate-docs-ai` | **🔥 Full Auto.** Runs the complete workflow: Model generation, YAML sync, and Column generation using AI. |
 | `--generate-docs` | **🔄 Full Sync.** Runs the complete workflow using only the database cache (no AI). |
 | `--cleanup-db` | **Reset Database.** Wipes the description cache and history. |
 | `--concurrency` | Max threads for AI/DB requests (default: 10). |
