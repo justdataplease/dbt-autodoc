@@ -11,49 +11,7 @@ import os
 
 from dbt_autodoc import cli
 
-class TestDbtConfigManipulator:
-    def test_extract_description_simple(self):
-        sql = """
-        {{ config(
-            materialized='table',
-            description="This is a test table"
-        ) }}
-        SELECT * FROM source
-        """
-        desc = cli.DbtConfigManipulator.extract_description(sql)
-        assert desc == "This is a test table"
 
-    def test_extract_description_no_description(self):
-        sql = """
-        {{ config(
-            materialized='table'
-        ) }}
-        SELECT * FROM source
-        """
-        desc = cli.DbtConfigManipulator.extract_description(sql)
-        assert desc is None
-
-    def test_update_or_create_update_existing(self):
-        sql = """
-        {{ config(
-            description="Old description"
-        ) }}
-        """
-        new_desc = "New description"
-        updated_sql = cli.DbtConfigManipulator.update_or_create(sql, new_desc)
-        assert 'description="New description"' in updated_sql
-        assert "Old description" not in updated_sql
-
-    def test_update_or_create_add_new(self):
-        sql = """
-        {{ config(
-            materialized='table'
-        ) }}
-        """
-        new_desc = "New description"
-        updated_sql = cli.DbtConfigManipulator.update_or_create(sql, new_desc)
-        assert 'description = "New description"' in updated_sql
-        assert "materialized='table'" in updated_sql
 
 class TestResolveDescription:
     @pytest.fixture

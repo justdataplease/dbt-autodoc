@@ -358,96 +358,6 @@ class DatabaseAdapter:
                 pass
 
 
-class DbtConfigManipulator:
-    @staticmethod
-    def extract_description(sql_content):
-        try:
-            start_marker = "{{ config("
-            start_idx = sql_content.find(start_marker)
-            if start_idx == -1:
-                start_marker = "{{config("
-                start_idx = sql_content.replace(" ", "").find(start_marker)
-                if start_idx == -1:
-                    return None
-
-            open_paren_idx = sql_content.find("(", start_idx)
-            balance = 0
-            insertion_point = -1
-
-            for i in range(open_paren_idx, len(sql_content)):
-                char = sql_content[i]
-                if char == '(':
-                    balance += 1
-                elif char == ')':
-                    balance -= 1
-                if balance == 0:
-                    insertion_point = i
-                    break
-
-            if insertion_point == -1: return None
-
-            config_body = sql_content[open_paren_idx + 1: insertion_point]
-            desc_pattern = re.compile(r"description\s*=\s*(['\"])([\s\S]*?)\1")
-            match = desc_pattern.search(config_body)
-
-            if match:
-                return match.group(2)
-            return None
-        except Exception:
-            return None
-
-    @staticmethod
-    def update_or_create(sql_content, description):
-        try:
-            clean_desc = str(description).replace('"', "'")
-            start_marker = "{{ config("
-            start_idx = sql_content.find(start_marker)
-
-            if start_idx == -1:
-                start_marker = "{{config("
-                start_idx = sql_content.replace(" ", "").find(start_marker)
-                if start_idx == -1:
-                    new_config = f'{{{{ config(\n    description = "{clean_desc}"\n) }}}}\n\n'
-                    return new_config + sql_content
-
-            balance = 0
-            insertion_point = -1
-            open_paren_idx = sql_content.find("(", start_idx)
-
-            for i in range(open_paren_idx, len(sql_content)):
-                char = sql_content[i]
-                if char == '(':
-                    balance += 1
-                elif char == ')':
-                    balance -= 1
-                if balance == 0:
-                    insertion_point = i
-                    break
-
-            if insertion_point == -1: return sql_content
-
-            config_body = sql_content[open_paren_idx + 1: insertion_point]
-            desc_pattern = re.compile(r"(description\s*=\s*)(['\"])([\s\S]*?)(['\"])")
-            match = desc_pattern.search(config_body)
-
-            if match:
-                new_body = config_body[:match.start(3)] + description + config_body[match.end(3):]
-                return sql_content[:open_paren_idx + 1] + new_body + sql_content[insertion_point:]
-            else:
-                clean_body = config_body.rstrip()
-                needs_comma = True if clean_body and not clean_body.endswith(",") else False
-                comma = "," if needs_comma else ""
-
-                if not clean_body:
-                    new_body = f'\n    description = "{description}"\n'
-                else:
-                    new_body = f'{clean_body}{comma}\n    description = "{description}"\n'
-
-                return sql_content[:open_paren_idx + 1] + new_body + sql_content[insertion_point:]
-        except Exception as e:
-            print(f"❌ parsing error in SQL update: {e}")
-            return sql_content
-
 # --- 4. MANIFEST / UPSTREAM EXTENSION ---
 def load_manifest(manifest_path="target/manifest.json"):
     """Loads dbt manifest.json to understand the DAG."""
@@ -730,7 +640,7 @@ def find_model_sql_path(model_name, base_dir):
     files = glob.glob(search_pattern, recursive=True)
     return files[0] if files else None
 
-def process_single_yaml_file(file_path, db, use_ai, show_prompt, executor, model_path_override=None):
+def process_single_yaml_file(file_path, db, use_ai, show_prompt, executor, model_path_override=None, scope='both'):
     if "dbt_project.yml" in file_path or "dbt-autodoc.yml" in file_path: return
 
     try:
@@ -772,34 +682,59 @@ def process_single_yaml_file(file_path, db, use_ai, show_prompt, executor, model
 
         # Collect tasks for this model (columns)
         futures = {}
-        for c_idx, col in enumerate(model_node.get('columns', [])):
-            c_name = col.get('name')
-            curr_desc = col.get('description')
+        
+        # --- MODEL DESCRIPTION TASK ---
+        if scope in ['tables', 'both']:
+            model_desc_curr = model_node.get('description')
             
-            # Submit task
-            future = executor.submit(
+            future_model = executor.submit(
                 resolve_description,
-                curr_desc, m_name, c_name, db, use_ai,
-                is_table=False,
-                table_context=table_desc_context,
+                model_desc_curr, m_name, TABLE_MARKER, db, use_ai,
+                is_table=True,
+                table_context=None,
                 sql_content=sql_content,
                 show_prompt=show_prompt
             )
-            futures[future] = (m_idx, c_idx)
+            # Use -1 as column index to indicate Model Task
+            futures[future_model] = (m_idx, -1)
 
-        # Wait for all columns in this model to finish
+        # --- COLUMN DESCRIPTION TASKS ---
+        if scope in ['columns', 'both']:
+            for c_idx, col in enumerate(model_node.get('columns', [])):
+                c_name = col.get('name')
+                curr_desc = col.get('description')
+                
+                # Submit task
+                future = executor.submit(
+                    resolve_description,
+                    curr_desc, m_name, c_name, db, use_ai,
+                    is_table=False,
+                    table_context=table_desc_context,
+                    sql_content=sql_content,
+                    show_prompt=show_prompt
+                )
+                futures[future] = (m_idx, c_idx)
+
+        # Wait for all tasks for this model to finish
         for future in concurrent.futures.as_completed(futures):
             _, c_idx = futures[future]
             try:
                 res = future.result()
-                col = model_node['columns'][c_idx]
-                curr_desc = col.get('description')
                 
-                if res and res != curr_desc:
-                    col['description'] = DoubleQuotedScalarString(res)
-                    changed = True
+                if c_idx == -1: # Model Description
+                    curr_desc = model_node.get('description')
+                    if res and res != curr_desc:
+                        model_node['description'] = DoubleQuotedScalarString(res)
+                        changed = True
+                else: # Column Description
+                    col = model_node['columns'][c_idx]
+                    curr_desc = col.get('description')
+                    
+                    if res and res != curr_desc:
+                        col['description'] = DoubleQuotedScalarString(res)
+                        changed = True
             except Exception as e:
-                print(f"❌ Error processing column in {m_name}: {e}")
+                print(f"❌ Error processing in {m_name}: {e}")
 
     if changed:
         try:
@@ -808,8 +743,8 @@ def process_single_yaml_file(file_path, db, use_ai, show_prompt, executor, model
         except Exception as e:
             print(f"❌ Failed to write back to {file_path}: {e}")
 
-def action_process_yaml_columns(db, use_ai=False, show_prompt=False, concurrency=10, model_path=None):
-    print(f"\n📂 Processing YAML Columns (AI={use_ai})...")
+def action_process_yaml_columns(db, use_ai=False, show_prompt=False, concurrency=10, model_path=None, scope='both'):
+    print(f"\n📂 Processing YAML Models & Columns (AI={use_ai}, scope={scope})...")
     target_dir = model_path if model_path else DBT_MODELS_DIR
     yml_files = glob.glob(os.path.join(target_dir, "**/_*.yml"), recursive=True)
 
@@ -822,56 +757,7 @@ def action_process_yaml_columns(db, use_ai=False, show_prompt=False, concurrency
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
         for f in yml_files:
-            process_single_yaml_file(f, db, use_ai, show_prompt, executor, model_path_override=model_path)
-
-
-def process_single_sql_file(file_path, db, use_ai, show_prompt):
-    m_name = os.path.splitext(os.path.basename(file_path))[0]
-
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-    except Exception as e:
-        print(f"❌ SKIPPING reading {m_name}: {e}")
-        return
-
-    curr_desc = DbtConfigManipulator.extract_description(content)
-
-    new_desc = resolve_description(
-        curr_desc, m_name, TABLE_MARKER, db, use_ai,
-        is_table=True,
-        table_context=None,
-        sql_content=content,
-        show_prompt=show_prompt
-    )
-
-    if new_desc and new_desc != curr_desc:
-        new_content = DbtConfigManipulator.update_or_create(content, new_desc)
-        if new_content != content:
-            print(f"📝 Updating SQL: {m_name}")
-            try:
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(new_content)
-            except Exception as e:
-                print(f"❌ Failed to write SQL {m_name}: {e}")
-
-def action_process_sql_configs(db, use_ai=False, show_prompt=False, concurrency=10, model_path=None):
-    print(f"\n📄 Processing SQL Model Configs (AI={use_ai})...")
-    target_dir = model_path if model_path else DBT_MODELS_DIR
-    sql_files = glob.glob(os.path.join(target_dir, "**/*.sql"), recursive=True)
-
-    if not sql_files:
-        print(f"⚠️  No .sql files found in {target_dir}")
-        return
-    
-    # Process concurrently
-    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures = [executor.submit(process_single_sql_file, f, db, use_ai, show_prompt) for f in sql_files]
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                future.result()
-            except Exception as e:
-                print(f"❌ Error processing SQL file: {e}")
+            process_single_yaml_file(f, db, use_ai, show_prompt, executor, model_path_override=model_path, scope=scope)
 
 
 def validate_dbt_project():
@@ -921,8 +807,8 @@ def main():
     
     parser.add_argument("--generate-docs-yml", action="store_true", help="Run dbt-osmosis and sync YAML structure (No AI). Saves manual edits to DB.")
     parser.add_argument("--generate-docs-yml-ai", action="store_true", help="Run dbt-osmosis, sync YAML, and AI-generate column descriptions.")
-    parser.add_argument("--generate-docs-config", action="store_true", help="Sync SQL config blocks (No AI). Saves manual edits to DB.")
-    parser.add_argument("--generate-docs-config-ai", action="store_true", help="Sync SQL config blocks and AI-generate table descriptions.")
+    parser.add_argument("--generate-docs-config", action="store_true", help="[DEPRECATED] Sync SQL config blocks (No AI). Now handled in YAML.")
+    parser.add_argument("--generate-docs-config-ai", action="store_true", help="[DEPRECATED] Sync SQL config blocks and AI-generate table descriptions. Now handled in YAML.")
     
     parser.add_argument("--regenerate-yml", action="store_true", help="Regenerate YAML files from dbt models (preserves descriptions).")
     parser.add_argument("--regenerate-yml-with-inheritance", action="store_true", help="Regenerate YAML files with description inheritance enabled.")
@@ -1006,36 +892,38 @@ def main():
             # Full flow NO AI
             # 1. Osmosis (Sync structure & inherit)
             action_run_osmosis(with_inheritance=False)
-            # 2. SQL Configs (Sync)
-            action_process_sql_configs(db, use_ai=False, show_prompt=args.show_prompt, concurrency=concurrency, model_path=args.model_path)
-            # 3. YAML Columns (Sync)
-            action_process_yaml_columns(db, use_ai=False, show_prompt=args.show_prompt, concurrency=concurrency, model_path=args.model_path)
-            # 4. Osmosis (Final check/format)
+            # 2. Process YAMLs (Models & Columns with AI)
+            action_process_yaml_columns(db, use_ai=False, show_prompt=args.show_prompt, concurrency=concurrency, model_path=args.model_path, scope='both')
+            # 3. Osmosis (Final check/format)
             action_run_osmosis(with_inheritance=False)
-            # 5. YAML Columns (Sync again - capturing inherited updates to DB)
-            action_process_yaml_columns(db, use_ai=False, show_prompt=args.show_prompt, concurrency=concurrency, model_path=args.model_path)
+            # 4. Process YAMLs (Sync again)
+            action_process_yaml_columns(db, use_ai=False, show_prompt=args.show_prompt, concurrency=concurrency, model_path=args.model_path, scope='both')
 
         elif args.generate_docs_ai:
             # Full flow WITH AI
             # 1. Osmosis (Sync structure & inherit)
             action_run_osmosis(with_inheritance=False)
-            # 2. SQL Configs (Generate Table Descriptions)
-            action_process_sql_configs(db, use_ai=True, show_prompt=args.show_prompt, concurrency=concurrency, model_path=args.model_path)
-            # 3. YAML Columns (Generate Column Descriptions)
-            action_process_yaml_columns(db, use_ai=True, show_prompt=args.show_prompt, concurrency=concurrency, model_path=args.model_path)
-            # 4. Osmosis (Final check/format)
+            # 2. Process YAMLs (Models & Columns with AI)
+            action_process_yaml_columns(db, use_ai=True, show_prompt=args.show_prompt, concurrency=concurrency, model_path=args.model_path, scope='both')
+            # 3. Osmosis (Final check/format)
             action_run_osmosis(with_inheritance=False)
-            # 5. YAML Columns (Sync again - capturing inherited updates to DB)
-            action_process_yaml_columns(db, use_ai=False, show_prompt=args.show_prompt, concurrency=concurrency, model_path=args.model_path)
+            # 4. Process YAMLs (Sync again)
+            action_process_yaml_columns(db, use_ai=False, show_prompt=args.show_prompt, concurrency=concurrency, model_path=args.model_path, scope='both')
 
-        # Individual Flags (Original behavior)
+        # Individual Flags (Original behavior adapted)
         else:
             if args.generate_docs_yml or args.generate_docs_yml_ai:
                 action_run_osmosis(with_inheritance=False)
-                action_process_yaml_columns(db, use_ai=args.generate_docs_yml_ai, show_prompt=args.show_prompt, concurrency=concurrency, model_path=args.model_path)
+                # Maps to columns (preserving original intent of 'yml' flag being columns)
+                # But allowing 'both' is probably safer for users expecting "autodoc everything". 
+                # Let's stick to columns for strict backward compat? No, let's do both or explicit.
+                # The user asked for config to be tables. So yml should be columns.
+                action_process_yaml_columns(db, use_ai=args.generate_docs_yml_ai, show_prompt=args.show_prompt, concurrency=concurrency, model_path=args.model_path, scope='columns')
 
             if args.generate_docs_config or args.generate_docs_config_ai:
-                action_process_sql_configs(db, use_ai=args.generate_docs_config_ai, show_prompt=args.show_prompt, concurrency=concurrency, model_path=args.model_path)
+                 print("⚠️  --generate-docs-config flags are now mapped to YAML processing (Table descriptions now live in YAML).")
+                 # Maps to tables (preserving original intent of 'config' flag being tables)
+                 action_process_yaml_columns(db, use_ai=args.generate_docs_config_ai, show_prompt=args.show_prompt, concurrency=concurrency, model_path=args.model_path, scope='tables')
 
     except KeyboardInterrupt:
         print("\n🔴 Script interrupted by user. Exiting...")
