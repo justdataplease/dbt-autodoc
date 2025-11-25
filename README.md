@@ -18,7 +18,7 @@
     ```
 
 2.  **Configuration:**
-    Run `dbt-autodoc` to generate `dbt-autodoc.yml`.
+    Run `dbt-autodoc --help` to generate `dbt-autodoc.yml`.
     **Important:** Edit `company_context` in this file to give the AI knowledge about your business logic.
 
 3.  **Environment Variables:**
