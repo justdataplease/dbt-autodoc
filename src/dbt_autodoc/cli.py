@@ -26,6 +26,7 @@ def check_dependencies():
     try:
         from ruamel.yaml import YAML
         from ruamel.yaml.scalarstring import DoubleQuotedScalarString
+        from ruamel.yaml.comments import CommentedMap
     except ImportError:
         missing.append("ruamel.yaml")
     
@@ -48,12 +49,7 @@ import duckdb
 import google.generativeai as genai
 from ruamel.yaml import YAML, YAMLError
 from ruamel.yaml.scalarstring import DoubleQuotedScalarString
-try:
-    import psycopg2
-    from psycopg2 import pool as psycopg2_pool
-except ImportError:
-    psycopg2 = None
-    psycopg2_pool = None
+from ruamel.yaml.comments import CommentedMap, CommentedSeq
 
 
 # --- 2. SETUP & CONFIG ---
@@ -640,6 +636,39 @@ def find_model_sql_path(model_name, base_dir):
     files = glob.glob(search_pattern, recursive=True)
     return files[0] if files else None
 
+def _reorder_map_keys(node: CommentedMap, preferred_order: list):
+    if not isinstance(node, CommentedMap):
+        return
+
+    current_items = []
+    # Pop all items in their original order, storing them with original comments
+    for key in list(node.keys()):
+        value = node.pop(key)
+        # Attempt to capture comments associated with the key
+        # This is a heuristic and might not be perfect for all ruamel.yaml comment types
+        key_comment = node.yaml_get_comment_before_after_key(key)
+        items_to_reinsert.append((key, value, key_comment))
+    
+    # Sort items based on preferred_order, then alphabetically for remaining
+    def sort_key_func(item):
+        key = item[0]
+        try:
+            return (preferred_order.index(key), key)
+        except ValueError:
+            return (len(preferred_order), key) # Place unspecified keys at the end, then alpha
+
+    items_to_reinsert.sort(key=sort_key_func)
+
+    # Re-insert into the node, attempting to restore comments
+    for idx, (key, value, key_comment) in enumerate(items_to_reinsert):
+        node.insert(idx, key, value)
+        # Re-attach comments for the re-inserted key if they existed
+        if key_comment and key_comment[0]: # Before comment
+            node.yaml_set_comment_before_after_key(key, comment=key_comment[0])
+        if key_comment and key_comment[1]: # After comment (end-of-line)
+             node.yaml_add_eol_comment(comment=key_comment[1].strip(), key=key)
+
+
 def process_single_yaml_file(file_path, db, use_ai, show_prompt, executor, model_path_override=None, scope='both'):
     if "dbt_project.yml" in file_path or "dbt-autodoc.yml" in file_path: return
 
@@ -659,6 +688,11 @@ def process_single_yaml_file(file_path, db, use_ai, show_prompt, executor, model
     
     # Base directory for searching SQL files
     base_sql_dir = model_path_override if model_path_override else DBT_MODELS_DIR
+
+    # Preferred order for model keys
+    preferred_model_keys_order = ['name', 'description', 'columns']
+    # Preferred order for column keys
+    preferred_column_keys_order = ['name', 'description']
 
     # Iterate over models sequentially
     for m_idx, model_node in enumerate(data['models']):
@@ -724,17 +758,34 @@ def process_single_yaml_file(file_path, db, use_ai, show_prompt, executor, model
                 if c_idx == -1: # Model Description
                     curr_desc = model_node.get('description')
                     if res and res != curr_desc:
-                        model_node['description'] = DoubleQuotedScalarString(res)
+                        # Ensure description is inserted after 'name'
+                        if 'description' not in model_node and 'name' in model_node:
+                            name_idx = list(model_node.keys()).index('name')
+                            model_node.insert(name_idx + 1, 'description', DoubleQuotedScalarString(res))
+                        else:
+                            model_node['description'] = DoubleQuotedScalarString(res)
                         changed = True
                 else: # Column Description
                     col = model_node['columns'][c_idx]
                     curr_desc = col.get('description')
                     
                     if res and res != curr_desc:
-                        col['description'] = DoubleQuotedScalarString(res)
+                        # Ensure description is inserted after 'name' in columns too
+                        if 'description' not in col and 'name' in col:
+                            name_idx = list(col.keys()).index('name')
+                            col.insert(name_idx + 1, 'description', DoubleQuotedScalarString(res))
+                        else:
+                            col['description'] = DoubleQuotedScalarString(res)
                         changed = True
             except Exception as e:
                 print(f"❌ Error processing in {m_name}: {e}")
+        
+        # After processing model and its columns, reorder keys
+        _reorder_map_keys(model_node, preferred_model_keys_order)
+        if 'columns' in model_node and isinstance(model_node['columns'], CommentedSeq):
+            for col in model_node['columns']:
+                if isinstance(col, CommentedMap):
+                    _reorder_map_keys(col, preferred_column_keys_order)
 
     if changed:
         try:
