@@ -103,6 +103,7 @@ It synthesizes all these inputs to write a concise, technical description.
 | `--generate-docs` | **🔄 Full Sync.** Runs the complete workflow using only the database cache (no AI). |
 | `--cleanup-db` | **Reset Database.** Wipes the description cache and history. |
 | `--concurrency` | Max threads for AI/DB requests (default: 10). |
+| `--sort-yml` | Sort keys in YAML files (name, description, columns for models; name, description for columns). |
 
 ## 📄 License
 

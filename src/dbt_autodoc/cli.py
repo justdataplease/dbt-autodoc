@@ -640,33 +640,48 @@ def _reorder_map_keys(node: CommentedMap, preferred_order: list):
     if not isinstance(node, CommentedMap):
         return
 
-    current_items = []
-    # Pop all items in their original order, storing them with original comments
+    # Store original items with their comments
+    items_with_comments = []
     for key in list(node.keys()):
         value = node.pop(key)
-        # Attempt to capture comments associated with the key
-        # This is a heuristic and might not be perfect for all ruamel.yaml comment types
-        key_comment = node.yaml_get_comment_before_after_key(key)
-        items_to_reinsert.append((key, value, key_comment))
+        # ruamel.yaml stores comments in various places. This is a best effort.
+        # It's challenging to reliably extract *all* comment types associated with a key
+        # without deep knowledge of ruamel.yaml's internal comment structure.
+        # This approach tries to capture comments that might be 'before' the key or 'eol' (end-of-line).
+        
+        # Get comment before the key
+        pre_comment = node.yaml_get_comment_before_after_key(key, _info=True)
+        before_comment = pre_comment[0][2].split('\n') if pre_comment and pre_comment[0] and pre_comment[0][2] else []
+        
+        # Get end-of-line comment
+        eol_comment = node.yaml_get_item_comment(key)
+        
+        items_with_comments.append({'key': key, 'value': value, 'before': before_comment, 'eol': eol_comment})
     
     # Sort items based on preferred_order, then alphabetically for remaining
     def sort_key_func(item):
-        key = item[0]
+        key = item['key']
         try:
             return (preferred_order.index(key), key)
         except ValueError:
             return (len(preferred_order), key) # Place unspecified keys at the end, then alpha
 
-    items_to_reinsert.sort(key=sort_key_func)
+    items_with_comments.sort(key=sort_key_func)
 
     # Re-insert into the node, attempting to restore comments
-    for idx, (key, value, key_comment) in enumerate(items_to_reinsert):
-        node.insert(idx, key, value)
-        # Re-attach comments for the re-inserted key if they existed
-        if key_comment and key_comment[0]: # Before comment
-            node.yaml_set_comment_before_after_key(key, comment=key_comment[0])
-        if key_comment and key_comment[1]: # After comment (end-of-line)
-             node.yaml_add_eol_comment(comment=key_comment[1].strip(), key=key)
+    for item in items_with_comments:
+        key = item['key']
+        value = item['value']
+        
+        # Insert key-value pair
+        node[key] = value
+
+        # Re-attach comments
+        if item['before']:
+            # For multiline comments, ruamel.yaml expects a single string with newlines
+            node.yaml_set_comment_before_after_key(key, before=''.join(item['before']))
+        if item['eol']:
+            node.yaml_set_comment_before_after_key(key, after=item['eol'])
 
 
 def process_single_yaml_file(file_path, db, use_ai, show_prompt, executor, model_path_override=None, scope='both'):
@@ -690,9 +705,10 @@ def process_single_yaml_file(file_path, db, use_ai, show_prompt, executor, model
     base_sql_dir = model_path_override if model_path_override else DBT_MODELS_DIR
 
     # Preferred order for model keys
-    preferred_model_keys_order = ['name', 'description', 'columns']
+    preferred_model_keys_order = ['name', 'description', 'access', 'config', 'columns']
     # Preferred order for column keys
-    preferred_column_keys_order = ['name', 'description']
+    preferred_column_keys_order = ['name', 'description', 'data_type', 'tests', 'meta']
+
 
     # Iterate over models sequentially
     for m_idx, model_node in enumerate(data['models']):
@@ -810,6 +826,51 @@ def action_process_yaml_columns(db, use_ai=False, show_prompt=False, concurrency
         for f in yml_files:
             process_single_yaml_file(f, db, use_ai, show_prompt, executor, model_path_override=model_path, scope=scope)
 
+def action_sort_yml(model_path=None):
+    print("\n reorganizing keys and sorting...")
+    target_dir = model_path if model_path else DBT_MODELS_DIR
+    yml_files = glob.glob(os.path.join(target_dir, "**/_*.yml"), recursive=True)
+
+    if not yml_files:
+        print(f"⚠️  No _*.yml files found in {target_dir}")
+        return
+
+    # Preferred order for model keys
+    preferred_model_keys_order = ['name', 'description', 'access', 'config', 'columns']
+    # Preferred order for column keys
+    preferred_column_keys_order = ['name', 'description', 'data_type', 'tests', 'meta']
+
+    for file_path in yml_files:
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = yaml.load(f)
+        except (YAMLError, UnicodeDecodeError) as e:
+            print(f"❌ SKIPPING broken file {os.path.basename(file_path)}: {e}")
+            continue
+        except Exception as e:
+            print(f"❌ Error reading {os.path.basename(file_path)}: {e}")
+            continue
+
+        if not data or 'models' not in data: continue
+
+        changed = False
+        for model_node in data['models']:
+            if isinstance(model_node, CommentedMap):
+                _reorder_map_keys(model_node, preferred_model_keys_order)
+                if 'columns' in model_node and isinstance(model_node['columns'], CommentedSeq):
+                    for col in model_node['columns']:
+                        if isinstance(col, CommentedMap):
+                            _reorder_map_keys(col, preferred_column_keys_order)
+                changed = True
+        
+        if changed:
+            try:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    yaml.dump(data, f)
+                print(f"✅ Reordered keys in {os.path.basename(file_path)}")
+            except Exception as e:
+                print(f"❌ Failed to write back to {file_path} after sorting: {e}")
+
 
 def validate_dbt_project():
     if not os.path.exists("dbt_project.yml"):
@@ -841,9 +902,9 @@ def main():
     example_text = """
      EXAMPLES:
      
-     dbt-autodoc --generate-docs-config-ai --generate-docs-yml-ai 
-     dbt-autodoc --generate-docs-config-ai --gemini-api-key="AIzaSy..."
-     dbt-autodoc --generate-docs-config-ai --show-prompt
+     dbt-autodoc --generate-docs-model-ai --generate-docs-model-columns-ai 
+     dbt-autodoc --generate-docs-model-ai --gemini-api-key="AIzaSy..."
+     dbt-autodoc --generate-docs-model-ai --show-prompt
      dbt-autodoc --cleanup-yml
     """
 
@@ -871,6 +932,7 @@ def main():
     
     parser.add_argument("--concurrency", type=int, default=None, help="Max concurrent threads (default: 10).")
     parser.add_argument("--model-path", type=str, default=None, help="Specific directory to process (e.g. models/staging). Defaults to configured dbt_models_dir.")
+    parser.add_argument("--sort-yml", action="store_true", help="Sort keys in YAML files (name, description, columns for models; name, description for columns).")
 
     try:
         args = parser.parse_args()
@@ -907,13 +969,19 @@ def main():
         concurrency = 10
 
     # --- VALIDATION ---
-    if not args.cleanup_yml and not args.cleanup_db:
+    if not args.cleanup_yml and not args.cleanup_db and not args.sort_yml:
         validate_dbt_project()
 
     # --- CLEANUP MODE ---
     if args.cleanup_yml:
         action_cleanup()
         return
+
+    # --- SORT ONLY MODE ---
+    if args.sort_yml:
+        action_sort_yml(model_path=args.model_path)
+        return
+
 
     # --- RUNTIME ---
     project_info = get_dbt_project_info()
